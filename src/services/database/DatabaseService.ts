@@ -437,6 +437,148 @@ class DatabaseService {
         db!.prepare(sql).run(...params);
     }
 
+    /**
+     * Migrate fb_auto_comment_configs + fb_auto_comment_logs from the old
+     * schema (shopee_links/fixed_comment + comment_1/comment_2) to the current
+     * unified `comments` JSON column. Idempotent: detects both already-migrated
+     * and unknown-schema states and skips.
+     *
+     * Runs before CREATE TABLE so a fresh DB still gets the new schema; for an
+     * already-migrated DB the old `_old` table is cleaned up on a second pass.
+     */
+    private migrateAutoCommentTables(): void {
+        try {
+            this.migrateAutoCommentConfigs();
+            this.migrateAutoCommentLogs();
+            // Cleanup any orphan _old tables left from a previous interrupted migration
+            this.exec(`DROP TABLE IF EXISTS fb_auto_comment_configs_old`);
+            this.exec(`DROP TABLE IF EXISTS fb_auto_comment_logs_old`);
+        } catch (err: any) {
+            Logger.error(`[DatabaseService] AutoComment migration error: ${err.message}`);
+        }
+    }
+
+    private migrateAutoCommentConfigs(): void {
+        const cols = this.query<any>(`PRAGMA table_info(fb_auto_comment_configs)`);
+        if (cols.length === 0) return; // fresh DB — CREATE TABLE below will handle it
+        const hasNew = cols.some((c) => c.name === 'comments');
+        const hasOld = cols.some((c) => c.name === 'shopee_links');
+        if (hasNew) return;
+        if (!hasOld) {
+            Logger.warn('[DatabaseService] fb_auto_comment_configs: unknown schema, skipping migration');
+            return;
+        }
+
+        Logger.log('[DatabaseService] Migrating fb_auto_comment_configs to unified comments column');
+        const rowCount = (this.queryOne<any>(`SELECT COUNT(*) AS n FROM fb_auto_comment_configs`)?.n) ?? 0;
+
+        this.exec(`DROP INDEX IF EXISTS idx_fb_auto_comment_account`);
+        this.exec(`ALTER TABLE fb_auto_comment_configs RENAME TO fb_auto_comment_configs_old`);
+        this.exec(`
+            CREATE TABLE fb_auto_comment_configs (
+                id                  TEXT PRIMARY KEY,
+                workspace_id            TEXT DEFAULT '',
+                account_id             TEXT NOT NULL,
+                comments               TEXT DEFAULT '[]',
+                group_ids              TEXT DEFAULT '[]',
+                max_posts_per_run      INTEGER DEFAULT 10,
+                schedule_minutes       INTEGER DEFAULT 60,
+                enabled                INTEGER DEFAULT 1,
+                created_at             INTEGER NOT NULL,
+                updated_at             INTEGER NOT NULL
+            )
+        `);
+
+        if (rowCount > 0) {
+            const oldRows = this.query<any>(`SELECT * FROM fb_auto_comment_configs_old`);
+            this.transaction(() => {
+                for (const row of oldRows) {
+                    let shopeeLinks: string[] = [];
+                    try { shopeeLinks = JSON.parse(row.shopee_links || '[]'); } catch {}
+                    const fixed = row.fixed_comment || '';
+                    const comments = fixed ? [fixed, ...shopeeLinks] : shopeeLinks;
+                    this.run(
+                        `INSERT INTO fb_auto_comment_configs
+                         (id, workspace_id, account_id, comments, group_ids,
+                          max_posts_per_run, schedule_minutes, enabled, created_at, updated_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [
+                            row.id,
+                            row.workspace_id || '',
+                            row.account_id,
+                            JSON.stringify(comments),
+                            row.group_ids || '[]',
+                            row.max_comments_per_run || 10,
+                            row.schedule_minutes || 60,
+                            row.enabled ?? 1,
+                            row.created_at,
+                            row.updated_at,
+                        ],
+                    );
+                }
+            });
+        }
+        Logger.log(`[DatabaseService] fb_auto_comment_configs migrated (${rowCount} rows preserved)`);
+    }
+
+    private migrateAutoCommentLogs(): void {
+        const cols = this.query<any>(`PRAGMA table_info(fb_auto_comment_logs)`);
+        if (cols.length === 0) return;
+        const hasNew = cols.some((c) => c.name === 'comments');
+        const hasOld = cols.some((c) => c.name === 'comment_1');
+        if (hasNew) return;
+        if (!hasOld) {
+            Logger.warn('[DatabaseService] fb_auto_comment_logs: unknown schema, skipping migration');
+            return;
+        }
+
+        Logger.log('[DatabaseService] Migrating fb_auto_comment_logs to unified comments column');
+        const rowCount = (this.queryOne<any>(`SELECT COUNT(*) AS n FROM fb_auto_comment_logs`)?.n) ?? 0;
+
+        this.exec(`DROP INDEX IF EXISTS idx_fb_auto_comment_logs_config`);
+        this.exec(`ALTER TABLE fb_auto_comment_logs RENAME TO fb_auto_comment_logs_old`);
+        this.exec(`
+            CREATE TABLE fb_auto_comment_logs (
+                id           TEXT PRIMARY KEY,
+                config_id    TEXT NOT NULL,
+                group_id     TEXT NOT NULL,
+                group_name   TEXT DEFAULT '',
+                post_id      TEXT NOT NULL,
+                comments     TEXT DEFAULT '[]',
+                status       TEXT DEFAULT 'success',
+                error        TEXT DEFAULT '',
+                executed_at  INTEGER NOT NULL,
+                FOREIGN KEY (config_id) REFERENCES fb_auto_comment_configs(id) ON DELETE CASCADE
+            )
+        `);
+
+        if (rowCount > 0) {
+            const oldRows = this.query<any>(`SELECT * FROM fb_auto_comment_logs_old`);
+            this.transaction(() => {
+                for (const row of oldRows) {
+                    const comments = [row.comment_1, row.comment_2].filter((c) => !!c);
+                    this.run(
+                        `INSERT INTO fb_auto_comment_logs
+                         (id, config_id, group_id, group_name, post_id, comments, status, error, executed_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [
+                            row.id,
+                            row.config_id,
+                            row.group_id,
+                            row.group_name || '',
+                            row.post_id,
+                            JSON.stringify(comments),
+                            row.status || 'success',
+                            row.error || '',
+                            row.executed_at,
+                        ],
+                    );
+                }
+            });
+        }
+        Logger.log(`[DatabaseService] fb_auto_comment_logs migrated (${rowCount} rows preserved)`);
+    }
+
     /** Run an INSERT and return the new rowid. */
     public runInsert(sql: string, params: any[] = []): number {
         const result = db!.prepare(sql).run(...params);
@@ -1135,6 +1277,52 @@ class DatabaseService {
                 FOREIGN KEY (fb_account_id) REFERENCES fb_accounts(id)
             );
             CREATE INDEX IF NOT EXISTS idx_fb_crm_account ON fb_crm_contacts(fb_account_id);
+        `);
+
+        // ─── Facebook Auto Comment ────────────────────────────────────────────────
+        // Migrate old (shopee_links/fixed_comment + comment_1/comment_2) schema
+        // before CREATE TABLE so we don't lock the table in a half-state.
+        this.migrateAutoCommentTables();
+
+        this.exec(`
+            CREATE TABLE IF NOT EXISTS fb_auto_comment_configs (
+                id                      TEXT PRIMARY KEY,
+                workspace_id            TEXT DEFAULT '',
+                account_id             TEXT NOT NULL,
+                comments               TEXT DEFAULT '[]',
+                group_ids              TEXT DEFAULT '[]',
+                max_posts_per_run      INTEGER DEFAULT 10,
+                schedule_minutes       INTEGER DEFAULT 60,
+                enabled                INTEGER DEFAULT 1,
+                created_at             INTEGER NOT NULL,
+                updated_at             INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fb_auto_comment_account ON fb_auto_comment_configs(account_id);
+        `);
+
+        // Add doc_id_create_comment column if missing (idempotent migration).
+        // Operator can override the hardcoded default in code when FB rotates the doc id.
+        const hasDocIdCol = this.query<any>(
+            `PRAGMA table_info(fb_auto_comment_configs)`
+        )?.some((c: any) => c.name === 'doc_id_create_comment');
+        if (!hasDocIdCol) {
+            this.exec(`ALTER TABLE fb_auto_comment_configs ADD COLUMN doc_id_create_comment TEXT DEFAULT NULL`);
+        }
+
+        this.exec(`
+            CREATE TABLE IF NOT EXISTS fb_auto_comment_logs (
+                id              TEXT PRIMARY KEY,
+                config_id       TEXT NOT NULL,
+                group_id        TEXT NOT NULL,
+                group_name      TEXT DEFAULT '',
+                post_id         TEXT NOT NULL,
+                comments        TEXT DEFAULT '[]',
+                status          TEXT DEFAULT 'success',
+                error           TEXT DEFAULT '',
+                executed_at     INTEGER NOT NULL,
+                FOREIGN KEY (config_id) REFERENCES fb_auto_comment_configs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_fb_auto_comment_logs_config ON fb_auto_comment_logs(config_id);
         `);
 
         // ─── Proxies ─────────────────────────────────────────────────────────────

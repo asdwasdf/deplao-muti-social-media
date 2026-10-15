@@ -154,6 +154,7 @@ export class FacebookAutoCommentService {
         enabled: !!row.enabled,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        doc_id_create_comment: row.doc_id_create_comment || null,
       }));
     } catch (err: any) {
       Logger.error(`[FacebookAutoCommentService] Error getting configs: ${err.message}`);
@@ -256,6 +257,14 @@ export class FacebookAutoCommentService {
     // Track posts đã comment để tránh spam cùng 1 post
     const commentedPosts = new Set<string>();
 
+    // Resolve doc_id once per config. Operator can override per-config in DB
+    // when Facebook rotates the mutation's doc_id; otherwise fall back to the
+    // hardcoded default captured from a working browser request.
+    const resolvedDocId = (config.doc_id_create_comment || '').trim() || DOC_ID_CREATE_COMMENT;
+    if (resolvedDocId !== DOC_ID_CREATE_COMMENT) {
+      Logger.log(`[FacebookAutoCommentService] Using custom doc_id from config: ${resolvedDocId}`);
+    }
+
     for (const post of sortedPosts) {
       if (postsCommented >= config.max_posts_per_run) break;
       if (commentedPosts.has(post.postId)) continue;
@@ -274,7 +283,7 @@ export class FacebookAutoCommentService {
         const commentText = comments[i];
 
         try {
-          const commentResult = await this.commentOnPost(service, post.postId, commentText, post.groupId);
+          const commentResult = await this.commentOnPost(service, post.postId, commentText, post.groupId, resolvedDocId);
 
           if (commentResult.success) {
             postedComments.push(commentText);
@@ -461,9 +470,9 @@ export class FacebookAutoCommentService {
   }
 
   /** Comment lên bài viết */
-  private async commentOnPost(service: FacebookService, postId: string, text: string, groupId?: string): Promise<{ success: boolean; error?: string }> {
+  private async commentOnPost(service: FacebookService, postId: string, text: string, groupId?: string, docId?: string): Promise<{ success: boolean; error?: string }> {
     try {
-      return await this.commentViaGraphQL(service, postId, text, groupId);
+      return await this.commentViaGraphQL(service, postId, text, groupId, docId);
     } catch (err: any) {
       Logger.error(`[AutoComment.commentOnPost] post=${postId} threw: ${err.message}`);
       return { success: false, error: err.message };
@@ -489,7 +498,7 @@ export class FacebookAutoCommentService {
   }
 
   /** Comment qua GraphQL mutation */
-  private async commentViaGraphQL(service: FacebookService, postId: string, text: string, groupId?: string): Promise<{ success: boolean; error?: string }> {
+  private async commentViaGraphQL(service: FacebookService, postId: string, text: string, groupId?: string, docId?: string): Promise<{ success: boolean; error?: string }> {
     try {
       const cookie = secureGet(fbCookieKey(service['accountId']));
       if (!cookie) return { success: false, error: 'No cookie' };
@@ -541,7 +550,7 @@ export class FacebookAutoCommentService {
 
       const { url, body, headers } = buildGraphQLRequest(dataFB, cookie, {
         friendlyName: FRIENDLY_CREATE_COMMENT,
-        docId: DOC_ID_CREATE_COMMENT,
+        docId: docId || DOC_ID_CREATE_COMMENT,
         variables,
       });
 
@@ -656,6 +665,7 @@ export class FacebookAutoCommentService {
         enabled: !!row.enabled,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        doc_id_create_comment: row.doc_id_create_comment || null,
       };
     } catch {
       return null;
@@ -671,8 +681,8 @@ export class FacebookAutoCommentService {
     DatabaseService.getInstance().run(
       `INSERT OR REPLACE INTO fb_auto_comment_configs
        (id, workspace_id, account_id, comments, group_ids,
-        max_posts_per_run, schedule_minutes, enabled, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        max_posts_per_run, schedule_minutes, enabled, created_at, updated_at, doc_id_create_comment)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, config.workspace_id || '', config.account_id || '',
        JSON.stringify(config.comments || []),
        JSON.stringify(normalizedGroups),
@@ -680,7 +690,8 @@ export class FacebookAutoCommentService {
        config.schedule_minutes || 60,
        config.enabled ? 1 : 0,
        config.created_at || now,
-       now]
+       now,
+       config.doc_id_create_comment || null]
     );
 
     this.stop();
