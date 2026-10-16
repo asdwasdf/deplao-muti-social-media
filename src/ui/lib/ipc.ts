@@ -38,6 +38,17 @@ export interface NativeLoginIpcResult {
   error?: string;
 }
 
+export type BrowserLoginIpcEvent =
+  | { kind: 'opening' }
+  | { kind: 'navigating' }
+  | { kind: 'waitingUser' }
+  | { kind: 'captchaDetected' }
+  | { kind: 'twofaRequired' }
+  | { kind: 'verifying' }
+  | { kind: 'success'; facebookId: string; name: string; cookie: string }
+  | { kind: 'error'; message: string }
+  | { kind: 'cancelled' };
+
 
 declare global {
   interface Window {
@@ -524,6 +535,9 @@ declare global {
         startMessengerLiteLogin: (params: { proxyId?: number | null }) => Promise<NativeLoginIpcResult>;
         submitMessengerLiteLogin: (params: { sessionId: string; input: Record<string, string>; proxyId?: number | null }) => Promise<NativeLoginIpcResult>;
         cancelMessengerLiteLogin: (params: { sessionId: string }) => Promise<{ success: boolean }>;
+        startBrowserLogin: (params: { proxyId?: number | null; headless?: boolean }) => Promise<{ success: boolean; sessionId?: string; error?: string }>;
+        cancelBrowserLogin: (params: { sessionId: string }) => Promise<{ success: boolean; error?: string }>;
+        onBrowserLoginEvent: (cb: (data: { sessionId: string; event: BrowserLoginIpcEvent }) => void) => () => void;
         removeAccount:        (params: { accountId: string }) => Promise<{ success: boolean; error?: string }>;
         updateCookie:         (params: { accountId: string; cookie: string }) => Promise<{ success: boolean; error?: string }>;
         refreshProfile:       (params: { accountId: string }) => Promise<{ success: boolean; name?: string; avatarUrl?: string; error?: string, facebookId?: string }>;
@@ -595,6 +609,35 @@ declare global {
         scanGetRequestLogs: (params: { tabId: string; limit?: number; offset?: number }) => Promise<{ success: boolean; logs: any[]; total: number; error?: string }>;
         scanGetStats:       (params: { accountId: string }) => Promise<{ success: boolean; totalTabs: number; totalItems: number; successCount: number; errorCount: number; byType: Record<string, number>; topTabs: Array<{ id: string; name: string; itemsCount: number }>; error?: string }>;
         scanResetCache:       () => Promise<{ success: boolean; error?: string }>;
+      };
+      // ─── Auto Comment ─────────────────────────────────────────────────
+      autoComment: {
+        getConfigs:() => Promise<{ success: boolean; configs: any[]; error?: string }>;
+        getConfig:(params: { id: string }) => Promise<{ success: boolean; config: any | null; error?: string }>;
+        saveConfig:(params: any) => Promise<{ success: boolean; id?: string; error?: string }>;
+        deleteConfig:(params: { id: string }) => Promise<{ success: boolean; error?: string }>;
+        getLogs:(params: { configId: string; limit?: number }) => Promise<{ success: boolean; logs: any[]; error?: string }>;
+        runNow:(params: { configId: string }) => Promise<{ success: boolean; commentsPosted: number; postsTargeted: number; errors: string[]; error?: string }>;
+        startWorker:() => Promise<{ success: boolean; error?: string }>;
+        stopWorker:() => Promise<{ success: boolean; error?: string }>;
+        getStatus:() => Promise<{ success: boolean; status?: { enabled: boolean; lastRunAt: number; lastRunSummary: string; nextRunAt: number; totalRuns: number; minutesSinceLastRun: number; minutesToNextRun: number }; error?: string }>;
+        // Multi-account / job APIs
+        runJob:(params: { configId: string }) => Promise<{ success: boolean; jobId?: string; error?: string }>;
+        cancelJob:(params: { jobId: string }) => Promise<{ success: boolean; error?: string }>;
+        stopFlow:(params: { configId: string }) => Promise<{ success: boolean; cancelled?: number; signalled?: number; error?: string }>;
+        getJobs:(params?: { configId?: string; accountId?: string; limit?: number }) => Promise<{ success: boolean; jobs: any[]; error?: string }>;
+        getJobLogs:(params: { jobId: string; limit?: number }) => Promise<{ success: boolean; logs: any[]; error?: string }>;
+        getWorkerStatus:() => Promise<{
+          success: boolean;
+          status?: { enabled: boolean; lastTickAt: number; lastError: string; nextTickAt: number; runningCount: number; runningJobIds: string[]; pendingCount: number; globalConcurrency: number };
+          error?: string;
+        }>;
+        checkAccountSession:(params: { accountId: string }) => Promise<{ success: boolean; state: 'verified' | 'cookie_missing' | 'expired' | 'unknown'; reason?: string; error?: string }>;
+        // Browser debug
+        debugDumpCookie:(params: { accountId: string }) => Promise<{ success: boolean; path?: string; error?: string }>;
+        debugOpenBrowserWithCookie:(params: { accountId: string; startUrl?: string }) => Promise<{ success: boolean; url?: string; alreadyOpen?: boolean; error?: string }>;
+        debugCloseBrowser:(params?: { accountId?: string }) => Promise<{ success: boolean; error?: string }>;
+        debugListOpenBrowsers:() => Promise<{ success: boolean; accountIds: string[]; error?: string }>;
       };
       // ─── Telegram Bot ──────────────────────────────────────────────────
       telegram: {
@@ -852,6 +895,7 @@ export const ipc = {
   workspace: window.electronAPI?.workspace,
   relay: window.electronAPI?.relay,
   fb: window.electronAPI?.fb,
+  autoComment: window.electronAPI?.autoComment,
   telegram: window.electronAPI?.telegram,
   telegramUser: window.electronAPI?.telegramUser,
   proxy: window.electronAPI?.proxy,

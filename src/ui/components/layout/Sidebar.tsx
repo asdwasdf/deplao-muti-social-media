@@ -402,6 +402,10 @@ export default function Sidebar({ onAddAccount }: SidebarProps) {
         {featureVisibility.analytics && hasPerm('analytics') && (
         <NavBtn icon="analytics"  label="Báo cáo"      active={view === 'analytics'}  onClick={() => setView('analytics')} />
         )}
+        {/* Auto Comment - cho Facebook Groups */}
+        {featureVisibility.autocomment && (
+        <NavBtn icon="autocomment"  label="Auto Comment"   active={view === 'autocomment'}  onClick={() => setView('autocomment')} />
+        )}
         {/* ERP - gated by module permission AND ERP RBAC (`erp.access`).
             Inside ERP, fine-grained writes enforced via `useErpPermissions().can(...)` +
             IPC middleware `withErpAuth`. */}
@@ -496,6 +500,12 @@ function NavBtn({ icon, label, active, onClick, dot }: { icon: string; label: st
     erp: (
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
         <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+      </svg>
+    ),
+    autocomment: (
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        <path d="M8 9h8"/><path d="M8 13h6"/>
       </svg>
     ),
   };

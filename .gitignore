@@ -17,3 +17,13 @@ docs/*
 .vscode/
 src/__tests__/*
 .gitmodules
+
+# Playwright cache
+.playwright-mcp/
+playwright-browsers/
+
+# Editor / backup files
+*.swp
+*.swo
+*~
+

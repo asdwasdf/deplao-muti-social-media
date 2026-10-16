@@ -17,6 +17,12 @@ import { registerEmployeeIpc } from './ipc/employeeIpc';
 import { registerRelayIpc } from './ipc/relayIpc';
 import { registerWorkspaceIpc } from './ipc/workspaceIpc';
 import { registerFacebookIpc, reconnectAllFBAccounts } from './ipc/facebookIpc';
+
+// Dynamic import helper for FacebookAutoCommentService
+async function importFacebookAutoCommentService(): Promise<void> {
+  const { FacebookAutoCommentService } = await import('../src/services/facebook/FacebookAutoCommentService');
+  FacebookAutoCommentService.getInstance().start();
+}
 import { registerTelegramIpc } from './ipc/telegramIpc';
 import { registerTelegramUserIpc } from './ipc/telegramUserIpc';
 import { registerProxyIpc } from './ipc/proxyIpc';
@@ -1231,6 +1237,10 @@ app.whenReady().then(async () => {
       console.error('[main] reconnectAllTelegramAccounts error:', err.message);
     });
     startTelegramBotHealthCheck();
+    // Auto Comment service
+    importFacebookAutoCommentService().catch(err => {
+      console.error('[main] FacebookAutoCommentService error:', err.message);
+    });
     // Ordered startup: relay + Zalo for local workspaces, then remote workspaces.
     setTimeout(() => startupAllWorkspaces().catch(err => {
       console.error('[main] startupAllWorkspaces error:', err.message);

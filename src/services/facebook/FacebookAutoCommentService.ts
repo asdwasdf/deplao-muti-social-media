@@ -2,11 +2,13 @@
  * FacebookAutoCommentService.ts
  * Service tự động comment vào các bài viết trong groups được chọn
  *
- * Luồng:
- * 1. Worker chạy theo schedule (mỗi X phút)
- * 2. Lấy config → groups → bài viết mới nhất từ mỗi group
- * 3. Với mỗi bài viết: comment tất cả templates theo thứ tự
- * 4. Log kết quả vào DB
+ * Luồng (multi-account, flow/job tách biệt):
+ * 1. Worker (scheduler) tick → với mỗi enabled flow quá hạn → enqueueJob
+ * 2. Job chờ slot toàn cục (≤3) + account lock (1 job / account tại 1 thời điểm)
+ * 3. Job chạy runConfig → log per-post vào fb_auto_comment_logs với job_id
+ * 4. Kết thúc: cập nhật fb_auto_comment_jobs (status, started_at, ended_at, counters)
+ *
+ * Manual + scheduled cùng đi qua enqueueJob → cùng lock → chống duplicate.
  */
 
 import DatabaseService from '../database/DatabaseService';
@@ -14,7 +16,13 @@ import FacebookService from './FacebookService';
 import { secureGet } from '../secure/SecureSettingsService';
 import Logger from '../../utils/Logger';
 import { v4 as uuid } from 'uuid';
-import { AutoCommentConfig, AutoCommentLog, AutoCommentRunResult } from '../../models/autoComment';
+import {
+  AutoCommentConfig,
+  AutoCommentJob,
+  AutoCommentJobStatus,
+  AutoCommentLog,
+  AutoCommentRunResult,
+} from '../../models/autoComment';
 import axios from 'axios';
 import { buildFormData, buildGraphQLRequest, buildPostConfig, parseFBResponse, jsonMinimal, getNextReqId } from './FacebookUtils';
 import { assertFacebookMutationSuccess } from './FacebookGraphQLResult';
@@ -56,12 +64,24 @@ function normalizeGroupId(raw: string): string {
 
 export class FacebookAutoCommentService {
   private static instance: FacebookAutoCommentService;
-  private workerTimer: ReturnType<typeof setInterval> | null = null;
-  private isRunning: boolean = false;
+  private workerTimer: ReturnType<typeof setTimeout> | null = null;
+  private workerEnabled: boolean = false;
+  private lastTickAt: number = 0;
+  private lastTickError: string = '';
+
+  /** Max parallel jobs across all accounts. */
+  private readonly GLOBAL_CONCURRENCY = 3;
+  /** Per-account serialization. accountId → promise chain. */
+  private accountLocks = new Map<string, Promise<unknown>>();
+  /** Currently executing job per account (for UI badges). */
+  private activeJobByAccount = new Map<string, string>();
+  /** Cancel flags by jobId, checked between posts. */
+  private cancelFlags = new Map<string, boolean>();
+  /** Set of jobIds scheduled but not yet started (so we don't double-enqueue). */
+  private pendingJobIds = new Set<string>();
+  /** Scheduler last-tick → for "minutesSinceLastRun" UI. */
   private lastRunAt: number = 0;
-  private lastRunSummary: string = '';
   private nextRunAt: number = 0;
-  private totalRuns: number = 0;
 
   static getInstance(): FacebookAutoCommentService {
     if (!FacebookAutoCommentService.instance) {
@@ -70,52 +90,247 @@ export class FacebookAutoCommentService {
     return FacebookAutoCommentService.instance;
   }
 
-  /** Bắt đầu worker */
+  // ─── Worker (scheduler) ────────────────────────────────────────────────────
+
   start(): void {
-    if (this.workerTimer) return;
-    Logger.log('[FacebookAutoCommentService] Starting worker...');
-    this.scheduleNextRun();
+    if (this.workerEnabled) return;
+    this.workerEnabled = true;
+    this.lastTickError = '';
+    Logger.log('[FacebookAutoCommentService] Worker started');
+    this.scheduleNextTick();
   }
 
-  /** Dừng worker */
   stop(): void {
     if (this.workerTimer) {
       clearTimeout(this.workerTimer);
       this.workerTimer = null;
-      Logger.log('[FacebookAutoCommentService] Worker stopped');
     }
+    this.workerEnabled = false;
+    Logger.log('[FacebookAutoCommentService] Worker stopped');
   }
 
-  /** Lên lịch chạy tiếp theo */
-  private scheduleNextRun(): void {
+  /**
+   * Schedule the next tick. Picks the smallest schedule_minutes across all
+   * enabled flows so each flow gets re-evaluated at its own pace inside
+   * enqueueDueJobs().
+   */
+  private scheduleNextTick(): void {
+    if (!this.workerEnabled) return;
     const configs = this.getAllEnabledConfigs();
     if (configs.length === 0) {
-      Logger.log('[FacebookAutoCommentService] No enabled configs, retrying in 60s');
-      this.workerTimer = setTimeout(() => this.scheduleNextRun(), 60000);
-      this.nextRunAt = Date.now() + 60000;
+      // Idle: ping every 60s so newly-saved configs pick up quickly.
+      this.nextRunAt = Date.now() + 60_000;
+      this.workerTimer = setTimeout(() => this.tick(), 60_000);
       return;
     }
-
-    const minSchedule = Math.min(...configs.map(c => c.schedule_minutes * 60 * 1000));
-    this.nextRunAt = Date.now() + minSchedule;
-    Logger.log(
-      `[FacebookAutoCommentService] Next run in ${minSchedule / 60000} minutes ` +
-      `(${new Date(this.nextRunAt).toISOString()}) for ${configs.length} config(s)`
-    );
-
-    this.workerTimer = setTimeout(async () => {
-      try {
-        await this.runAllConfigs();
-      } catch (err: any) {
-        Logger.error(`[FacebookAutoCommentService] Tick crashed: ${err.message}. Rescheduling.`);
-      } finally {
-        // Self-recovery: luôn schedule lại kể cả khi crash
-        this.scheduleNextRun();
-      }
-    }, minSchedule);
+    const minMs = Math.max(60_000, Math.min(...configs.map(c => c.schedule_minutes * 60 * 1000)));
+    this.nextRunAt = Date.now() + minMs;
+    this.workerTimer = setTimeout(() => this.tick(), minMs);
   }
 
-  /** Status cho UI — biết scheduler có chạy không */
+  private async tick(): Promise<void> {
+    if (!this.workerEnabled) return;
+    this.lastTickAt = Date.now();
+    this.lastRunAt = this.lastTickAt;
+    try {
+      await this.enqueueDueJobs();
+    } catch (err: any) {
+      this.lastTickError = err.message || String(err);
+      Logger.error(`[FacebookAutoCommentService] Tick crashed: ${this.lastTickError}`);
+    } finally {
+      this.scheduleNextTick();
+    }
+  }
+
+  /**
+   * For each enabled flow, decide if a new job is due. Enqueue respects
+   * per-account lock (one at a time per account) and global concurrency cap.
+   */
+  private async enqueueDueJobs(): Promise<void> {
+    const configs = this.getAllEnabledConfigs();
+    const now = Date.now();
+    for (const config of configs) {
+      // Skip flows whose account has no cookie / no live service.
+      if (!secureGet(fbCookieKey(config.account_id))) continue;
+
+      // Don't enqueue another if this account already has pending/running job for this config.
+      if (this.activeJobByAccount.get(config.account_id)) {
+        const activeJobId = this.activeJobByAccount.get(config.account_id)!;
+        if (!this.cancelFlags.get(activeJobId) && this.jobBelongsToConfig(activeJobId, config.id)) {
+          continue;
+        }
+      }
+      if (this.hasPendingJobForConfig(config.id)) continue;
+
+      const lastJob = this.getLastJobForConfig(config.id);
+      const interval = config.schedule_minutes * 60 * 1000;
+      const lastAt = lastJob ? (lastJob.ended_at || lastJob.started_at || lastJob.scheduled_at) : 0;
+      if (now - lastAt < interval) continue;
+
+      // Soft cap: don't enqueue if we're at global cap and this account is not already running.
+      if (this.activeJobByAccount.size >= this.GLOBAL_CONCURRENCY) continue;
+
+      // Fire-and-forget; enqueueJob handles its own error logging.
+      this.enqueueJob(config.id, 'scheduled').catch((err) =>
+        Logger.error(`[FacebookAutoCommentService] enqueueJob failed: ${err.message}`),
+      );
+    }
+  }
+
+  // ─── Job lifecycle (manual + scheduled share this) ─────────────────────────
+
+  /**
+   * Insert a job row, then schedule execution through the lock pipeline.
+   * Returns the jobId immediately so the caller can navigate / poll.
+   */
+  async enqueueJob(configId: string, trigger: 'manual' | 'scheduled'): Promise<string> {
+    const config = this.getConfig(configId);
+    if (!config) throw new Error(`Config not found: ${configId}`);
+    if (!config.account_id) {
+      throw new Error('Config chưa gán tài khoản. Vui lòng chỉnh sửa flow và chọn tài khoản.');
+    }
+
+    // Reject duplicate manual clicks: if this config already has pending/running job.
+    if (this.hasPendingJobForConfig(configId)) {
+      throw new Error('Flow đã có job đang chờ/đang chạy. Vui lòng đợi hoặc dừng.');
+    }
+
+    const jobId = uuid();
+    const now = Date.now();
+    DatabaseService.getInstance().run(
+      `INSERT INTO fb_auto_comment_jobs
+         (id, config_id, account_id, trigger, status, scheduled_at)
+       VALUES (?, ?, ?, ?, 'pending', ?)`,
+      [jobId, configId, config.account_id, trigger, now],
+    );
+    this.pendingJobIds.add(jobId);
+
+    // Schedule actual execution without awaiting (caller gets jobId now).
+    this.runJob(jobId, config).catch((err) =>
+      Logger.error(`[FacebookAutoCommentService] runJob crashed: ${err.message}`),
+    );
+    return jobId;
+  }
+
+  private async runJob(jobId: string, config: AutoCommentConfig): Promise<void> {
+    // Acquire account lock — chain on existing promise.
+    const prev = this.accountLocks.get(config.account_id) || Promise.resolve();
+    const next = prev.then(() => this.executeJob(jobId, config)).catch(() => undefined);
+    this.accountLocks.set(config.account_id, next);
+    try {
+      await next;
+    } finally {
+      // Only clear if we are still the head of the chain.
+      if (this.accountLocks.get(config.account_id) === next) {
+        this.accountLocks.delete(config.account_id);
+      }
+    }
+  }
+
+  private async executeJob(jobId: string, config: AutoCommentConfig): Promise<void> {
+    this.pendingJobIds.delete(jobId);
+    this.activeJobByAccount.set(config.account_id, jobId);
+
+    const startedAt = Date.now();
+    this.updateJob(jobId, { status: 'running', started_at: startedAt });
+    Logger.log(`[FacebookAutoCommentService] Job ${jobId.slice(0, 8)} start account=${config.account_id.slice(0, 8)} config=${config.id.slice(0, 8)}`);
+
+    let result: AutoCommentRunResult;
+    try {
+      result = await this.runConfig(config, jobId);
+    } catch (err: any) {
+      Logger.error(`[FacebookAutoCommentService] runConfig threw: ${err.message}`);
+      result = { success: false, commentsPosted: 0, postsTargeted: 0, errors: [err.message], logs: [] };
+    } finally {
+      this.activeJobByAccount.delete(config.account_id);
+    }
+
+    const endedAt = Date.now();
+    const cancelRequested = !!this.cancelFlags.get(jobId);
+    this.cancelFlags.delete(jobId);
+
+    let finalStatus: AutoCommentJobStatus = 'success';
+    let errorSummary = '';
+    if (cancelRequested) {
+      finalStatus = 'cancelled';
+      errorSummary = 'Đã huỷ bởi người dùng';
+    } else if (!result.success) {
+      finalStatus = 'failed';
+      errorSummary = (result.errors[0] || 'Không rõ lỗi').slice(0, 500);
+    }
+
+    this.updateJob(jobId, {
+      status: finalStatus,
+      ended_at: endedAt,
+      posts_targeted: result.postsTargeted,
+      comments_posted: result.commentsPosted,
+      error: errorSummary,
+    });
+    Logger.log(
+      `[FacebookAutoCommentService] Job ${jobId.slice(0, 8)} ${finalStatus} ` +
+      `posts=${result.postsTargeted} comments=${result.commentsPosted}`,
+    );
+  }
+
+  /** Convenience: enqueue + return UI-shaped result. */
+  async runJobNow(configId: string): Promise<{ jobId: string }> {
+    const jobId = await this.enqueueJob(configId, 'manual');
+    return { jobId };
+  }
+
+  cancelJob(jobId: string): { success: boolean; error?: string } {
+    const job = this.getJob(jobId);
+    if (!job) return { success: false, error: 'Job not found' };
+    if (job.status === 'success' || job.status === 'failed' || job.status === 'cancelled') {
+      return { success: false, error: `Job đã ở trạng thái ${job.status}` };
+    }
+    // pending → mark immediately. running → set cancel flag for runConfig to honor.
+    this.cancelFlags.set(jobId, true);
+    if (job.status === 'pending') {
+      this.updateJob(jobId, { status: 'cancelled', ended_at: Date.now(), error: 'Đã huỷ trước khi chạy' });
+      this.pendingJobIds.delete(jobId);
+    }
+    return { success: true };
+  }
+
+  /**
+   * Cancel every pending job of a flow and signal any running job to stop.
+   * Does NOT toggle the schedule — flow remains enabled and will fire again.
+   */
+  stopFlow(configId: string): { cancelled: number; signalled: number } {
+    let cancelled = 0;
+    let signalled = 0;
+    const all = this.getJobsByConfig(configId);
+    for (const j of all) {
+      if (j.status === 'pending') {
+        this.updateJob(j.id, { status: 'cancelled', ended_at: Date.now(), error: 'Dừng flow' });
+        this.pendingJobIds.delete(j.id);
+        cancelled++;
+      } else if (j.status === 'running') {
+        this.cancelFlags.set(j.id, true);
+        signalled++;
+      }
+    }
+    Logger.log(`[FacebookAutoCommentService] stopFlow ${configId.slice(0, 8)} cancelled=${cancelled} signalled=${signalled}`);
+    return { cancelled, signalled };
+  }
+
+  private hasPendingJobForConfig(configId: string): boolean {
+    const jobs = this.getJobsByConfig(configId);
+    return jobs.some(j => j.status === 'pending' || j.status === 'running');
+  }
+
+  private jobBelongsToConfig(jobId: string, configId: string): boolean {
+    const j = this.getJob(jobId);
+    return !!j && j.config_id === configId;
+  }
+
+  // ─── Status / read APIs ────────────────────────────────────────────────────
+
+  /**
+   * Worker-level status. Kept the legacy fields for back-compat with
+   * getStatus callers; add runningCount/pendingCount for the new UI.
+   */
   getStatus(): {
     enabled: boolean;
     lastRunAt: number;
@@ -127,80 +342,136 @@ export class FacebookAutoCommentService {
   } {
     const now = Date.now();
     return {
-      enabled: this.workerTimer !== null,
+      enabled: this.workerEnabled,
       lastRunAt: this.lastRunAt,
-      lastRunSummary: this.lastRunSummary,
+      lastRunSummary: this.lastRunAt
+        ? `Worker tick — ${this.activeJobByAccount.size}/${this.GLOBAL_CONCURRENCY} job(s) running`
+        : '',
       nextRunAt: this.nextRunAt,
-      totalRuns: this.totalRuns,
+      totalRuns: this.lastRunAt ? 1 : 0,
       minutesSinceLastRun: this.lastRunAt ? Math.round((now - this.lastRunAt) / 60000) : -1,
       minutesToNextRun: this.nextRunAt ? Math.max(0, Math.round((this.nextRunAt - now) / 60000)) : -1,
     };
   }
 
-  /** Lấy tất cả configs đang enabled */
+  /** New, richer worker status for the redesigned UI card. */
+  getWorkerStatus(): {
+    enabled: boolean;
+    lastTickAt: number;
+    lastError: string;
+    nextTickAt: number;
+    runningCount: number;
+    runningJobIds: string[];
+    pendingCount: number;
+    globalConcurrency: number;
+  } {
+    return {
+      enabled: this.workerEnabled,
+      lastTickAt: this.lastTickAt,
+      lastError: this.lastTickError,
+      nextTickAt: this.nextRunAt,
+      runningCount: this.activeJobByAccount.size,
+      runningJobIds: Array.from(this.activeJobByAccount.values()),
+      pendingCount: this.pendingJobIds.size,
+      globalConcurrency: this.GLOBAL_CONCURRENCY,
+    };
+  }
+
+  getJobs(opts: { configId?: string; accountId?: string; limit?: number } = {}): AutoCommentJob[] {
+    const where: string[] = [];
+    const params: any[] = [];
+    if (opts.configId) { where.push('config_id = ?'); params.push(opts.configId); }
+    if (opts.accountId) { where.push('account_id = ?'); params.push(opts.accountId); }
+    const sql = `SELECT * FROM fb_auto_comment_jobs${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY scheduled_at DESC LIMIT ?`;
+    params.push(opts.limit ?? 50);
+    const rows = DatabaseService.getInstance().query<any>(sql, params) || [];
+    return rows.map(this.mapJob);
+  }
+
+  getJob(id: string): AutoCommentJob | null {
+    const row = DatabaseService.getInstance().queryOne<any>(
+      `SELECT * FROM fb_auto_comment_jobs WHERE id = ?`, [id],
+    );
+    return row ? this.mapJob(row) : null;
+  }
+
+  getJobsByConfig(configId: string): AutoCommentJob[] {
+    return this.getJobs({ configId, limit: 100 });
+  }
+
+  getLastJobForConfig(configId: string): AutoCommentJob | null {
+    const rows = this.getJobs({ configId, limit: 1 });
+    return rows[0] || null;
+  }
+
+  getJobLogs(jobId: string): AutoCommentLog[] {
+    return this.getLogsByJob(jobId);
+  }
+
+  private mapJob = (row: any): AutoCommentJob => ({
+    id: row.id,
+    config_id: row.config_id,
+    account_id: row.account_id,
+    trigger: row.trigger,
+    status: row.status,
+    scheduled_at: row.scheduled_at,
+    started_at: row.started_at,
+    ended_at: row.ended_at,
+    posts_targeted: row.posts_targeted || 0,
+    comments_posted: row.comments_posted || 0,
+    error: row.error || '',
+  });
+
+  private updateJob(jobId: string, patch: Partial<AutoCommentJob>): void {
+    const fields: string[] = [];
+    const values: any[] = [];
+    for (const [k, v] of Object.entries(patch)) {
+      fields.push(`${k} = ?`);
+      values.push(v ?? null);
+    }
+    if (fields.length === 0) return;
+    values.push(jobId);
+    DatabaseService.getInstance().run(
+      `UPDATE fb_auto_comment_jobs SET ${fields.join(', ')} WHERE id = ?`,
+      values,
+    );
+  }
+
+  // ─── Configs / logs (unchanged behavior) ──────────────────────────────────
+
   private getAllEnabledConfigs(): AutoCommentConfig[] {
     try {
       const rows = DatabaseService.getInstance().query<any>(
         `SELECT * FROM fb_auto_comment_configs WHERE enabled = 1`
       ) || [];
-      return rows.map(row => ({
-        id: row.id,
-        workspace_id: row.workspace_id || '',
-        account_id: row.account_id,
-        comments: JSON.parse(row.comments || '[]'),
-        group_ids: JSON.parse(row.group_ids || '[]').map(normalizeGroupId).filter((id: string) => id),
-        max_posts_per_run: row.max_posts_per_run || 10,
-        schedule_minutes: row.schedule_minutes || 60,
-        enabled: !!row.enabled,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        doc_id_create_comment: row.doc_id_create_comment || null,
-      }));
+      return rows.map((row) => this.rowToConfig(row));
     } catch (err: any) {
       Logger.error(`[FacebookAutoCommentService] Error getting configs: ${err.message}`);
       return [];
     }
   }
 
-  /** Chạy tất cả configs */
-  async runAllConfigs(): Promise<void> {
-    if (this.isRunning) {
-      Logger.warn('[FacebookAutoCommentService] Already running, skipping...');
-      return;
-    }
-
-    this.isRunning = true;
-    this.lastRunAt = Date.now();
-    this.totalRuns++;
-    const configs = this.getAllEnabledConfigs();
-    Logger.log(`[FacebookAutoCommentService] Tick #${this.totalRuns} — running ${configs.length} config(s)`);
-
-    let totalPosted = 0;
-    let totalTargets = 0;
-    const errors: string[] = [];
-
-    for (const config of configs) {
-      try {
-        const r = await this.runConfig(config);
-        totalPosted += r.commentsPosted;
-        totalTargets += r.postsTargeted;
-        if (!r.success) errors.push(...r.errors);
-      } catch (err: any) {
-        Logger.error(`[FacebookAutoCommentService] Error running config ${config.id}: ${err.message}`);
-        errors.push(err.message);
-      }
-    }
-
-    this.lastRunSummary = `Posted ${totalPosted} comments on ${totalTargets} posts${
-      errors.length > 0 ? `, ${errors.length} error(s)` : ''
-    }`;
-    Logger.log(`[FacebookAutoCommentService] Tick #${this.totalRuns} done: ${this.lastRunSummary}`);
-
-    this.isRunning = false;
+  /** Map raw DB row → AutoCommentConfig. Giữ nguyên \n bên trong từng comment template. */
+  private rowToConfig(row: any): AutoCommentConfig {
+    return {
+      id: row.id,
+      workspace_id: row.workspace_id || '',
+      account_id: row.account_id,
+      comments: JSON.parse(row.comments || '[]'),
+      group_ids: JSON.parse(row.group_ids || '[]').map(normalizeGroupId).filter((id: string) => id),
+      max_posts_per_run: row.max_posts_per_run || 10,
+      schedule_minutes: row.schedule_minutes || 60,
+      enabled: !!row.enabled,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      doc_id_create_comment: row.doc_id_create_comment || null,
+      comment_count_per_post: row.comment_count_per_post == null ? undefined : Number(row.comment_count_per_post),
+      comment_pick_mode: row.comment_pick_mode === 'random' ? 'random' : 'sequential',
+    };
   }
 
-  /** Chạy 1 config */
-  async runConfig(config: AutoCommentConfig): Promise<AutoCommentRunResult> {
+  /** Chạy 1 config — giữ nguyên logic, thêm jobId/cancelToken. */
+  async runConfig(config: AutoCommentConfig, jobId?: string): Promise<AutoCommentRunResult> {
     const result: AutoCommentRunResult = {
       success: true,
       commentsPosted: 0,
@@ -223,18 +494,40 @@ export class FacebookAutoCommentService {
       return result;
     }
 
-    // Lấy danh sách comments (filter empty lines)
-    const comments = config.comments.filter(c => c.trim());
+    // Mỗi phần tử của config.comments = 1 mẫu trọn vẹn (có thể chứa \n).
+    // Không split theo \n ở đây — chỉ filter mẫu rỗng (data cũ từ schema split-by-line).
+    const comments = config.comments.filter((c) => c.trim().length > 0);
     if (comments.length === 0) {
       result.success = false;
       result.errors.push('Chưa có nội dung comment');
       return result;
     }
 
+    // Số comment / bài: legacy (thiếu field) → mặc định = tất cả mẫu.
+    // Mới: cap bởi số mẫu hiện có, tối thiểu 1.
+    const perPost = Math.max(
+      1,
+      Math.min(
+        comments.length,
+        Number.isFinite(config.comment_count_per_post) && (config.comment_count_per_post ?? 0) > 0
+          ? Math.floor(config.comment_count_per_post as number)
+          : comments.length,
+      ),
+    );
+    const pickMode: 'random' | 'sequential' = config.comment_pick_mode === 'random' ? 'random' : 'sequential';
+    // Sequential: chỉ số chung cho cả job (xoay vòng giữa các bài).
+    let seqCursor = 0;
+
     // Lấy bài viết từ mỗi group
     const allPosts: { groupId: string; groupName: string; posts: GroupPost[] }[] = [];
 
     for (const groupId of config.group_ids) {
+      // Honor cancel between groups too.
+      if (jobId && this.cancelFlags.get(jobId)) {
+        result.success = false;
+        result.errors.push('Đã huỷ giữa chừng');
+        return result;
+      }
       try {
         const posts = await this.getGroupPosts(service, groupId, config.max_posts_per_run);
         const groupName = await this.getGroupName(service, groupId);
@@ -266,6 +559,13 @@ export class FacebookAutoCommentService {
     }
 
     for (const post of sortedPosts) {
+      if (jobId && this.cancelFlags.get(jobId)) {
+        result.success = false;
+        if (!result.errors.includes('Đã huỷ giữa chừng')) {
+          result.errors.push('Đã huỷ giữa chừng');
+        }
+        break;
+      }
       if (postsCommented >= config.max_posts_per_run) break;
       if (commentedPosts.has(post.postId)) continue;
 
@@ -278,9 +578,21 @@ export class FacebookAutoCommentService {
       const postedComments: string[] = [];
       let hasError = false;
 
-      // Comment lần lượt từng template
-      for (let i = 0; i < comments.length; i++) {
-        const commentText = comments[i];
+      // Chọn tối đa `perPost` mẫu cho bài này theo pickMode.
+      const picks = pickCommentIndices({
+        total: comments.length,
+        perPost,
+        mode: pickMode,
+        seqCursor,
+        randomSeed: post.postId + ':' + postsCommented, // deterministic-ish per (post, slot) cho log
+      });
+      // Cập nhật seqCursor cho sequential mode (xoay vòng giữa các bài).
+      if (pickMode === 'sequential') {
+        seqCursor = (seqCursor + perPost) % comments.length;
+      }
+
+      for (let i = 0; i < picks.length; i++) {
+        const commentText = comments[picks[i]];
 
         try {
           const commentResult = await this.commentOnPost(service, post.postId, commentText, post.groupId, resolvedDocId);
@@ -293,7 +605,7 @@ export class FacebookAutoCommentService {
           }
 
           // Delay giữa các comments (tránh spam)
-          if (i < comments.length - 1) {
+          if (i < picks.length - 1) {
             await this.delay(2000);
           }
         } catch (err: any) {
@@ -319,7 +631,7 @@ export class FacebookAutoCommentService {
         executed_at: Date.now(),
       };
 
-      this.saveLog(log);
+      this.saveLog(log, jobId);
       result.logs.push(log);
       commentedPosts.add(post.postId);
       postsCommented++;
@@ -406,35 +718,22 @@ export class FacebookAutoCommentService {
     }
   }
 
-  /** Parse www HTML → list post IDs. Nhiều pattern vì FB thay đổi format. */
+  /**
+   * Parse www HTML → list top-level post IDs.
+   *
+   * BUG-FIX: trước đây regex match mọi `/groups/<gid>/permalink/<pid>/` xuất hiện
+   * trong toàn trang — kể cả permalink của comment/reply (vì mỗi comment có URL
+   * permalink riêng). Hậu quả: bot duyệt cả reply và tự comment vào đó → spam
+   * câu trả lời. Cách phân biệt: top-level post permalink thường nằm trong
+   * FeedUnit_*, comment permalink nằm trong subtree có `data-pagelet*Comment*`
+   * hoặc anchor có `aria-label` chứa "Bình luận". Ta scan ~600 char phía trước
+   * anchor để xem anchor có nằm trong comment context không — nếu có thì bỏ qua.
+   *
+   * Implementation lives in module-level `extractPostIdsFromWwwFeed` so it can be
+   * unit-tested without instantiating the service.
+   */
   private parseWwwGroupFeed(html: string, groupId: string): GroupPost[] {
-    const posts: GroupPost[] = [];
-    const seen = new Set<string>();
-
-    // Pattern 1: /groups/<gid>/permalink/<pid>/ (classic permalink)
-    // Pattern 2: /groups/<gid>/posts/<pid>/ (new layout)
-    // Pattern 3: story_fbid=<pid> in query string
-    // Pattern 4: fbid=<pid> in query
-    // Pattern 5: "post_id":"<pid>" in embedded JSON
-    const patterns: RegExp[] = [
-      /\/groups\/\d+\/permalink\/(\d+)/g,
-      /\/groups\/\d+\/posts\/(\d+)/g,
-      /story_fbid(?:=|%3D)(\d+)/g,
-      /fbid(?:=|%3D)(\d+)/g,
-      /"post_id"\s*:\s*"?(\d+)"?/g,
-      /"id"\s*:\s*"(\d{10,})"/g, // pure numeric ID
-    ];
-
-    for (const re of patterns) {
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(html)) !== null) {
-        const postId = m[1];
-        if (seen.has(postId) || postId === groupId) continue;
-        seen.add(postId);
-        posts.push({ postId, groupId, groupName: '', timestamp: Date.now() });
-      }
-    }
-    return posts;
+    return extractPostIdsFromWwwFeed(html, groupId);
   }
 
   /** Lấy tên group từ GraphQL — fallback `Group <id>` nếu query fail */
@@ -605,13 +904,17 @@ export class FacebookAutoCommentService {
     );
   }
 
-  /** Kiểm tra đã comment bài này chưa */
+  /** Kiểm tra đã comment bài này chưa.
+   *  Trả về true nếu có bất kỳ log nào (success hoặc failed) trong 24h.
+   *  ponytail: dùng status IN ('success','failed') thay vì chỉ success
+   *  để nếu comment thất bại 1 lần, các job sau không spam thử lại cùng post.
+   */
   private async hasCommentedRecently(configId: string, postId: string): Promise<boolean> {
     try {
       const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
       const row = DatabaseService.getInstance().queryOne<any>(
         `SELECT id FROM fb_auto_comment_logs
-         WHERE config_id = ? AND post_id = ? AND status = 'success' AND executed_at > ?
+         WHERE config_id = ? AND post_id = ? AND status IN ('success','failed') AND executed_at > ?
          LIMIT 1`,
         [configId, postId, oneDayAgo]
       );
@@ -621,15 +924,16 @@ export class FacebookAutoCommentService {
     }
   }
 
-  /** Lưu log vào DB */
-  private saveLog(log: AutoCommentLog): void {
+  /** Lưu log vào DB. jobId gắn row với job đang chạy (nullable cho legacy). */
+  private saveLog(log: AutoCommentLog, jobId?: string): void {
     try {
       DatabaseService.getInstance().run(
         `INSERT INTO fb_auto_comment_logs
-         (id, config_id, group_id, group_name, post_id, comments, status, error, executed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, config_id, group_id, group_name, post_id, comments, status, error, executed_at, job_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [log.id, log.config_id, log.group_id, log.group_name, log.post_id,
-         JSON.stringify(log.comments), log.status, log.error || '', log.executed_at]
+         JSON.stringify(log.comments), log.status, log.error || '', log.executed_at,
+         jobId || null]
       );
     } catch (err: any) {
       Logger.error(`[FacebookAutoCommentService] Error saving log: ${err.message}`);
@@ -641,7 +945,7 @@ export class FacebookAutoCommentService {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  /** Lấy tất cả configs */
+  /** Lấy tất cả configs (back-compat — đã trả về enabled trước đây nên giữ nguyên). */
   getAllConfigs(): AutoCommentConfig[] {
     return this.getAllEnabledConfigs();
   }
@@ -654,19 +958,7 @@ export class FacebookAutoCommentService {
         [id]
       );
       if (!row) return null;
-      return {
-        id: row.id,
-        workspace_id: row.workspace_id || '',
-        account_id: row.account_id,
-        comments: JSON.parse(row.comments || '[]'),
-        group_ids: JSON.parse(row.group_ids || '[]'),
-        max_posts_per_run: row.max_posts_per_run || 10,
-        schedule_minutes: row.schedule_minutes || 60,
-        enabled: !!row.enabled,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        doc_id_create_comment: row.doc_id_create_comment || null,
-      };
+      return this.rowToConfig(row);
     } catch {
       return null;
     }
@@ -678,11 +970,20 @@ export class FacebookAutoCommentService {
     const now = Date.now();
     const normalizedGroups = (config.group_ids || []).map(normalizeGroupId).filter((g: string) => g);
 
+    // comment_count_per_post: explicit number → write through. undefined → NULL (= legacy
+    //   "đăng tất cả mẫu", giữ tương thích với dữ liệu cũ).
+    const perPostForDb =
+      config.comment_count_per_post == null
+        ? null
+        : Math.max(1, Math.floor(config.comment_count_per_post));
+    const pickModeForDb = config.comment_pick_mode === 'random' ? 'random' : 'sequential';
+
     DatabaseService.getInstance().run(
       `INSERT OR REPLACE INTO fb_auto_comment_configs
        (id, workspace_id, account_id, comments, group_ids,
-        max_posts_per_run, schedule_minutes, enabled, created_at, updated_at, doc_id_create_comment)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        max_posts_per_run, schedule_minutes, enabled, created_at, updated_at, doc_id_create_comment,
+        comment_count_per_post, comment_pick_mode)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, config.workspace_id || '', config.account_id || '',
        JSON.stringify(config.comments || []),
        JSON.stringify(normalizedGroups),
@@ -691,9 +992,12 @@ export class FacebookAutoCommentService {
        config.enabled ? 1 : 0,
        config.created_at || now,
        now,
-       config.doc_id_create_comment || null]
+       config.doc_id_create_comment || null,
+       perPostForDb,
+       pickModeForDb]
     );
 
+    // Refresh scheduler so new schedule_minutes takes effect.
     this.stop();
     this.start();
 
@@ -704,9 +1008,10 @@ export class FacebookAutoCommentService {
   deleteConfig(id: string): void {
     DatabaseService.getInstance().run(`DELETE FROM fb_auto_comment_configs WHERE id = ?`, [id]);
     DatabaseService.getInstance().run(`DELETE FROM fb_auto_comment_logs WHERE config_id = ?`, [id]);
+    // Jobs rows left in place for audit; FK CASCADE handles configs.
   }
 
-  /** Lấy logs */
+  /** Lấy logs theo config (giữ API cũ). jobId = null → trả legacy bucket. */
   getLogs(configId: string, limit: number = 100): AutoCommentLog[] {
     try {
       const rows = DatabaseService.getInstance().query<any>(
@@ -723,32 +1028,80 @@ export class FacebookAutoCommentService {
         status: row.status,
         error: row.error,
         executed_at: row.executed_at,
-      }));
+        job_id: row.job_id,
+      } as any));
     } catch {
       return [];
     }
   }
 
-  /** Chạy thủ công 1 config */
-  async runNow(configId: string): Promise<AutoCommentRunResult> {
-    if (this.isRunning) {
-      return {
-        success: false,
-        commentsPosted: 0,
-        postsTargeted: 0,
-        errors: ['Auto comment đang chạy, vui lòng đợi'],
-        logs: [],
-      };
-    }
-    const config = this.getConfig(configId);
-    if (!config) {
-      return { success: false, commentsPosted: 0, postsTargeted: 0, errors: ['Config not found'], logs: [] };
-    }
-    this.isRunning = true;
+  /** Logs của một job cụ thể. */
+  getLogsByJob(jobId: string, limit: number = 200): AutoCommentLog[] {
     try {
-      return await this.runConfig(config);
-    } finally {
-      this.isRunning = false;
+      const rows = DatabaseService.getInstance().query<any>(
+        `SELECT * FROM fb_auto_comment_logs WHERE job_id = ? ORDER BY executed_at DESC LIMIT ?`,
+        [jobId, limit]
+      ) || [];
+      return rows.map(row => ({
+        id: row.id,
+        config_id: row.config_id,
+        group_id: row.group_id,
+        group_name: row.group_name,
+        post_id: row.post_id,
+        comments: JSON.parse(row.comments || '[]'),
+        status: row.status,
+        error: row.error,
+        executed_at: row.executed_at,
+        job_id: row.job_id,
+      } as any));
+    } catch {
+      return [];
+    }
+  }
+
+  /** Legacy API for UI: chạy thủ công 1 config qua enqueueJob. */
+  async runNow(configId: string): Promise<AutoCommentRunResult> {
+    try {
+      const jobId = await this.enqueueJob(configId, 'manual');
+      // Wait for terminal state by polling DB.
+      const deadline = Date.now() + 30 * 60_000;
+      while (Date.now() < deadline) {
+        const j = this.getJob(jobId);
+        if (j && (j.status === 'success' || j.status === 'failed' || j.status === 'cancelled')) {
+          return {
+            success: j.status === 'success',
+            commentsPosted: j.comments_posted || 0,
+            postsTargeted: j.posts_targeted || 0,
+            errors: j.status === 'success' ? [] : [j.error || 'Job failed'],
+            logs: this.getLogsByJob(jobId),
+          };
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      return { success: false, commentsPosted: 0, postsTargeted: 0, errors: ['Timeout waiting for job'], logs: [] };
+    } catch (err: any) {
+      return { success: false, commentsPosted: 0, postsTargeted: 0, errors: [err.message], logs: [] };
+    }
+  }
+
+  /**
+   * Probe the session state of one account without doing network calls.
+   * Returns one of:
+   *  - 'cookie_missing': no encrypted cookie stored
+   *  - 'expired': cookie present but FacebookService not connected
+   *  - 'verified': cookie present + service reports connected
+   *  - 'unknown': unexpected state (cookie present but no service instance)
+   */
+  async checkAccountSession(accountId: string): Promise<{ state: 'verified' | 'cookie_missing' | 'expired' | 'unknown'; reason?: string }> {
+    try {
+      const cookie = secureGet(fbCookieKey(accountId));
+      if (!cookie) return { state: 'cookie_missing', reason: 'Chưa có cookie cho tài khoản này' };
+      const service = await FacebookService.getInstance(accountId).catch(() => null);
+      if (!service) return { state: 'unknown', reason: 'Service chưa khởi tạo' };
+      if (!service.isConnected()) return { state: 'expired', reason: 'Cookie hết hạn hoặc phiên đã đăng xuất' };
+      return { state: 'verified' };
+    } catch (err: any) {
+      return { state: 'unknown', reason: err.message };
     }
   }
 }
@@ -758,4 +1111,149 @@ interface GroupPost {
   groupId: string;
   groupName: string;
   timestamp: number;
+}
+
+/**
+ * Parse www HTML → list top-level post IDs. Module-level so it can be
+ * unit-tested. See `parseWwwGroupFeed` for full comment.
+ *
+ * @internal exported for testability
+ */
+export function extractPostIdsFromWwwFeed(html: string, groupId: string): GroupPost[] {
+  const posts: GroupPost[] = [];
+  const seen = new Set<string>();
+
+  const push = (postId: string) => {
+    if (seen.has(postId) || postId === groupId) return;
+    seen.add(postId);
+    posts.push({ postId, groupId, groupName: '', timestamp: Date.now() });
+  };
+
+  // Tìm kiếm "đang ở trong comment subtree" cho anchor tại vị trí idx.
+  // Ý tưởng: scan ngược từ anchor, tìm comment-marker gần nhất, rồi đếm thẻ
+  // mở vs đóng (div/article) từ marker đó tới anchor. Nếu depth > 0 → anchor
+  // vẫn nằm trong comment subtree → bỏ. Nếu depth = 0 → đã thoát ra top-level.
+  // Đây là cách chính xác hơn "substring window": tránh false-positive khi
+  // comment subtree dài > 600 char (case thực tế FB có thể dài hơn nhiều).
+  const COMMENT_MARKER = /(?:data-pagelet="[^"]*[Cc]omment[^"]*"|aria-label="[^"]*[Bb]ình luận[^"]*"|aria-label="[^"]*[Cc]omment[^"]*"|data-testid="[^"]*[Cc]omment[^"]*")/g;
+  const OPEN_TAG = /<(div|article|section|aside)\b[^>]*>/g;
+  const CLOSE_TAG = /<\/(div|article|section|aside)>/g;
+
+  const isInCommentContext = (idx: number): boolean => {
+    // Tìm comment-marker gần nhất trước anchor.
+    COMMENT_MARKER.lastIndex = 0;
+    let lastMarkerEnd = -1;
+    let mk: RegExpExecArray | null;
+    while ((mk = COMMENT_MARKER.exec(html)) !== null) {
+      if (mk.index >= idx) break;
+      lastMarkerEnd = mk.index + mk[0].length;
+    }
+    if (lastMarkerEnd < 0) return false;
+
+    // Đếm thẻ mở/đóng từ lastMarkerEnd tới idx. Depth > 0 ⇒ vẫn trong subtree.
+    let depth = 0;
+    OPEN_TAG.lastIndex = lastMarkerEnd;
+    CLOSE_TAG.lastIndex = lastMarkerEnd;
+    let openM: RegExpExecArray | null = OPEN_TAG.exec(html);
+    let closeM: RegExpExecArray | null = CLOSE_TAG.exec(html);
+    while ((openM && openM.index < idx) || (closeM && closeM.index < idx)) {
+      const nextOpen = openM ? openM.index : Infinity;
+      const nextClose = closeM ? closeM.index : Infinity;
+      if (nextOpen < nextClose) {
+        depth++;
+        openM = OPEN_TAG.exec(html);
+      } else {
+        depth--;
+        if (depth <= 0) return false; // đã thoát ra top-level trước anchor
+        closeM = CLOSE_TAG.exec(html);
+      }
+    }
+    return depth > 0;
+  };
+
+  const permRe = /\/groups\/\d+\/permalink\/(\d+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = permRe.exec(html)) !== null) {
+    if (isInCommentContext(m.index)) continue;
+    push(m[1]);
+  }
+
+  const postsRe = /\/groups\/\d+\/posts\/(\d+)/g;
+  while ((m = postsRe.exec(html)) !== null) {
+    if (isInCommentContext(m.index)) continue;
+    push(m[1]);
+  }
+
+  const fallbackPatterns: RegExp[] = [
+    /story_fbid(?:=|%3D)(\d+)/g,
+    /fbid(?:=|%3D)(\d+)/g,
+    /"post_id"\s*:\s*"?(\d+)"?/g,
+  ];
+  for (const re of fallbackPatterns) {
+    while ((m = re.exec(html)) !== null) {
+      push(m[1]);
+    }
+  }
+
+  if (posts.length === 0) {
+    const idRe = /"id"\s*:\s*"(\d{10,})"/g;
+    while ((m = idRe.exec(html)) !== null) {
+      push(m[1]);
+      if (posts.length >= 30) break;
+    }
+  }
+
+  return posts;
+}
+
+/**
+ * Chọn chỉ số mẫu để comment trên 1 bài.
+ * - sequential: lấy liên tiếp từ `seqCursor`, dừng khi hết 1 vòng.
+ * - random: shuffle lấy `perPost` mẫu không trùng; seed ổn định theo randomSeed.
+ *
+ * Không vượt quá `total`. Nếu `perPost >= total`, trả về tất cả (1 vòng).
+ */
+function pickCommentIndices(opts: {
+  total: number;
+  perPost: number;
+  mode: 'random' | 'sequential';
+  seqCursor: number;
+  randomSeed: string;
+}): number[] {
+  const { total, perPost, mode, seqCursor } = opts;
+  if (total <= 0 || perPost <= 0) return [];
+  const want = Math.min(perPost, total);
+
+  if (mode === 'random') {
+    // Seedable shuffle (mulberry32) — đảm bảo mỗi post lấy cùng tập con
+    // cho cùng seed; tránh kết quả khác nhau giữa các log của cùng job.
+    let h = 1779033703 ^ opts.randomSeed.length;
+    for (let i = 0; i < opts.randomSeed.length; i++) {
+      h = Math.imul(h ^ opts.randomSeed.charCodeAt(i), 3432918353);
+      h = (h << 13) | (h >>> 19);
+    }
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    h ^= h >>> 16;
+    const rng = () => {
+      h = (h + 0x6D2B79F5) | 0;
+      let t = h;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const idxs = Array.from({ length: total }, (_, i) => i);
+    for (let i = idxs.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [idxs[i], idxs[j]] = [idxs[j], idxs[i]];
+    }
+    return idxs.slice(0, want);
+  }
+
+  // sequential
+  const out: number[] = [];
+  for (let k = 0; k < want; k++) {
+    out.push((seqCursor + k) % total);
+  }
+  return out;
 }

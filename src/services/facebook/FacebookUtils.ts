@@ -135,6 +135,10 @@ export function buildFormData(
     '__req': reqId,
     '__rev': dataFB.clientRevision,
     'av': dataFB.FacebookID,
+    // Modern GraphQL defaults (best-effort, empty = OK)
+    '__aaid': '0',
+    'dpr': '1',
+    '__ccg': 'EXCELLENT',
   };
 
   if (opts?.requireGraphql !== false) {
@@ -142,9 +146,49 @@ export function buildFormData(
     form['fb_api_req_friendly_name'] = opts?.friendlyName || '';
     form['server_timestamps'] = 'true';
     form['doc_id'] = String(opts?.docId || '');
+    // __s: prefer serverNonce (modern), fallback sessionID
+    form['__s'] = dataFB.serverNonce || dataFB.sessionID || '';
   }
 
   return form;
+}
+
+/**
+ * Build complete GraphQL request (form body + headers) cho modern FB.
+ * Pattern dựa trên FacebookScanService.graphQLRequest (line 1026).
+ *
+ * Critical: header `x-fb-lsd` PHẢI gửi (kể cả rỗng) — thiếu = 1357054.
+ */
+export interface GraphQLRequestOpts {
+  friendlyName: string;
+  docId: string | number;
+  variables: Record<string, any>;
+  /** Default '/webgraphql/mutation/', group feed dùng '/webgraphql/query/' */
+  endpoint?: string;
+}
+
+export function buildGraphQLRequest(
+  dataFB: FBSessionData,
+  cookie: string,
+  opts: GraphQLRequestOpts,
+): { url: string; body: string; headers: Record<string, string> } {
+  const form = buildFormData(dataFB, {
+    friendlyName: opts.friendlyName,
+    docId: opts.docId,
+    requireGraphql: true,
+  });
+  form['variables'] = jsonMinimal(opts.variables);
+
+  const endpoint = opts.endpoint || '/webgraphql/mutation/';
+  const url = `https://www.facebook.com${endpoint}`;
+
+  // buildPostConfig với extraHeaders (Cookie có trong buildHeaders rồi)
+  const { data: body, headers } = buildPostConfig(url, form, cookie, 'www.facebook.com', undefined, {
+    'x-fb-lsd': dataFB.lsd || '',
+    'x-fb-friendly-name': opts.friendlyName,
+  });
+
+  return { url, body, headers };
 }
 
 /**
@@ -183,7 +227,8 @@ export function buildPostConfig(
   formData: Record<string, string>,
   cookie: string,
   host: string = 'www.facebook.com',
-  httpsAgent?: any
+  httpsAgent?: any,
+  extraHeaders?: Record<string, string>,
 ) {
   const body = new URLSearchParams(formData).toString();
   return {
@@ -192,6 +237,7 @@ export function buildPostConfig(
     headers: {
       ...buildHeaders(cookie, body.length, host),
       'Content-Type': 'application/x-www-form-urlencoded',
+      ...(extraHeaders || {}),
     },
     timeout: 30000,
     ...(httpsAgent ? { httpsAgent } : {}),
@@ -309,6 +355,81 @@ export function parseE2EECookies(cookieString: string): Record<string, string> {
   }
 
   return result;
+}
+
+/**
+ * Resolve đường dẫn đến Playwright Chromium binary dùng cho browser-based login.
+ * Thứ tự: PLAYWRIGHT_BROWSERS_PATH env → process.resourcesPath → dev paths → error
+ */
+export function resolvePlaywrightBrowserPath(): string {
+  const path = require('path');
+  const fs = require('fs');
+  const isWindows = process.platform === 'win32';
+  const exeName = isWindows ? 'chrome.exe' : 'chrome';
+
+  // 1. Explicit env override
+  if (process.env.PLAYWRIGHT_CHROMIUM_PATH && fs.existsSync(process.env.PLAYWRIGHT_CHROMIUM_PATH)) {
+    return process.env.PLAYWRIGHT_CHROMIUM_PATH;
+  }
+
+  // 2. Bundled with Electron app (production)
+  const rp = (process as any).resourcesPath;
+  if (rp) {
+    const candidates = [
+      path.join(rp, 'playwright-browsers', 'chrome-win64', exeName),
+      path.join(rp, 'playwright-browsers', 'chrome-win', exeName),
+      path.join(rp, 'playwright-browsers', 'chromium', exeName),
+      path.join(rp, 'playwright-browsers', `chromium-${exeName}`),
+    ];
+    // Also scan subdirs for nested layout
+    const root = path.join(rp, 'playwright-browsers');
+    if (fs.existsSync(root)) {
+      try {
+        const entries = fs.readdirSync(root, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory()) {
+            candidates.push(path.join(root, entry.name, 'chrome-win64', exeName));
+            candidates.push(path.join(root, entry.name, 'chrome-win', exeName));
+            candidates.push(path.join(root, entry.name, 'chrome-linux', exeName));
+            candidates.push(path.join(root, entry.name, exeName));
+          }
+        }
+      } catch { /* ignore */ }
+    }
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+  }
+
+  // 3. Development paths
+  const devCandidates = [
+    path.resolve(process.cwd(), 'playwright-browsers', 'chrome-win64', exeName),
+    path.resolve(process.cwd(), 'playwright-browsers', 'chrome-win', exeName),
+    path.resolve(process.cwd(), 'playwright-browsers', 'chromium', exeName),
+  ];
+  if (process.env.LOCALAPPDATA) {
+    try {
+      const cacheRoot = path.join(process.env.LOCALAPPDATA, 'ms-playwright');
+      if (fs.existsSync(cacheRoot)) {
+        const entries = fs.readdirSync(cacheRoot, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && entry.name.startsWith('chromium')) {
+            devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-win64', exeName));
+            devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-win', exeName));
+            devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-linux', exeName));
+          }
+        }
+      }
+    } catch { /* ignore */ }
+  }
+  for (const c of devCandidates) {
+    if (fs.existsSync(c)) return c;
+  }
+
+  throw new Error(
+    `Không tìm thấy Playwright Chromium (${exeName}). ` +
+    `Chạy 'npm run install:playwright' để tải browser, hoặc đặt biến môi trường PLAYWRIGHT_CHROMIUM_PATH.`
+  );
 }
 
 /**

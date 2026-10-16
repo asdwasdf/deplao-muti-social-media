@@ -13,7 +13,7 @@ const FB_HOME_URL = 'https://www.facebook.com/';
 
 /** Các field bắt buộc phải parse được để session hợp lệ */
 const REQUIRED_SESSION_FIELDS: (keyof FBSessionData)[] = [
-  'fb_dtsg', 'jazoest', 'sessionID', 'FacebookID', 'clientRevision',
+  'fb_dtsg', 'jazoest', 'sessionID', 'FacebookID', 'clientRevision', 'lsd',
 ];
 
 // Parse order: [name, startDelimiter, endDelimiter]
@@ -105,6 +105,42 @@ export async function initSession(cookie: string, httpsAgent?: any): Promise<FBS
   }
 
   result.cookieFacebook = cookie;
+
+  // ─── Modern GraphQL fields (best-effort, missing = warn) ─────────
+  // Pattern port từ FacebookScanService.ts:436-458
+
+  // LSD — critical, fail GraphQL nếu thiếu. Format: ["LSD",[],{"token":"..."},N]
+  const lsdMatch = html.match(/\["LSD",\[\],([^\]]+),\d+\]/);
+  if (lsdMatch) {
+    try { result.lsd = JSON.parse(lsdMatch[1]).token; } catch {}
+  }
+
+  // ServerNonce — dùng cho __s param
+  const nonceMatch = html.match(/\["ServerNonce",\[\],([^\]]+),\d+\]/);
+  if (nonceMatch) {
+    try {
+      const sn = JSON.parse(nonceMatch[1]);
+      result.serverNonce = sn.ServerNonce || sn.server_nonce || '';
+    } catch {}
+  }
+
+  // SprinkleConfig — cho __hsdp/__hblp nếu cần
+  const sprinkleMatch = html.match(/\["SprinkleConfig",\[\],([^\]]+),\d+\]/);
+  if (sprinkleMatch) {
+    try { result.sprinkleConfig = sprinkleMatch[1]; } catch {}
+  }
+
+  // MercuryServerRequestsConfig — cho polling params
+  const mercuryMatch = html.match(/\["MercuryServerRequestsConfig",\[\],([^\]]+),\d+\]/);
+  if (mercuryMatch) {
+    try { result.mercuryServerRequestsConfig = mercuryMatch[1]; } catch {}
+  }
+
+  // USID metadata — cần để LSD valid
+  const usidMatch = html.match(/\["USIDMetadata",\[\],([^\]]+),\d+\]/);
+  if (usidMatch) {
+    try { result.usidMetadata = usidMatch[1]; } catch {}
+  }
 
   // Validate required fields (port từ Python REQUIRED_SESSION_FIELDS)
   const missing = REQUIRED_SESSION_FIELDS.filter((f) => !hasValue(result[f]));

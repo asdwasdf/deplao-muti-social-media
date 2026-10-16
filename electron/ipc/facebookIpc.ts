@@ -4,7 +4,9 @@
  * Pattern: ipcMain.handle('fb:channel', async (_event, params) => { ... })
  */
 
-import { ipcMain, type IpcMainInvokeEvent } from 'electron';
+import { ipcMain, type IpcMainInvokeEvent, app } from 'electron';
+import * as fs from 'fs';
+import * as path from 'path';
 import { v4 as uuid } from 'uuid';
 import DatabaseService from '../../src/services/database/DatabaseService';
 import FacebookConnectionManager from '../../src/utils/FacebookConnectionManager';
@@ -12,6 +14,7 @@ import { initSession, fetchBasicProfileFromHome, fetchFBHomepage } from '../../s
 import { loginWithCredentials } from '../../src/services/facebook/FacebookLoginHelper';
 import { secureGet, secureSet, secureDelete } from '../../src/services/secure/SecureSettingsService';
 import FacebookE2EEBridge, { NativeLoginResult } from '../../src/services/facebook/FacebookE2EEBridge';
+import BrowserLoginService, { BrowserLoginEvent } from '../../src/services/facebook/BrowserLoginService';
 import { buildProxyUrl } from '../../src/utils/ProxyHelper';
 import { resolveE2EEBinaryPath } from '../../src/services/facebook/FacebookUtils';
 import FileStorageService from '../../src/services/file/FileStorageService';
@@ -430,6 +433,36 @@ export function registerFacebookIpc(): void {
   ipcMain.handle('fb:cancelMessengerLiteLogin', async (_event, { sessionId }: { sessionId?: string }) => {
     await disposeNativeLoginSession(String(sessionId || ''));
     return { success: true };
+  });
+
+  /**
+   * Browser-based FB login (Playwright Chromium).
+   * 1 session = 1 attempt. Service tự queue tuần tự nếu đang có attempt khác.
+   * Mỗi state transition được push về renderer qua `fb:browserLoginEvent`.
+   */
+  ipcMain.handle('fb:startBrowserLogin', async (event, params: { proxyId?: number | null; headless?: boolean } = {}) => {
+    try {
+      const service = BrowserLoginService.getInstance();
+      const { sessionId } = await service.start(
+        { proxyId: params.proxyId ?? null, headless: !!params.headless },
+        (ev: BrowserLoginEvent) => {
+          try { event.sender.send('fb:browserLoginEvent', { sessionId, event: ev }); } catch {}
+        }
+      );
+      return { success: true, sessionId };
+    } catch (err: any) {
+      Logger.warn(`[facebookIpc] startBrowserLogin error: ${err.message}`);
+      return { success: false, error: err.message || 'Không thể khởi động trình duyệt đăng nhập.' };
+    }
+  });
+
+  ipcMain.handle('fb:cancelBrowserLogin', async (_event, { sessionId }: { sessionId?: string }) => {
+    try {
+      await BrowserLoginService.getInstance().cancel(String(sessionId || ''));
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
   });
 
   /**
@@ -1655,6 +1688,223 @@ export function registerFacebookIpc(): void {
       return { success: true, ...stats };
     } catch (err: any) {
       return { success: false, error: err.message };
+    }
+  });
+
+  // ─── Auto Comment Handlers ─────────────────────────────────────────────────
+
+  ipcMain.handle('fb:autoComment:getConfigs', async () => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      const configs = FacebookAutoCommentService.getInstance().getAllConfigs();
+      return { success: true, configs };
+    } catch (err: any) {
+      return { success: false, configs: [], error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:getConfig', async (_event, { id }: { id: string }) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      const config = FacebookAutoCommentService.getInstance().getConfig(id);
+      return { success: true, config };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:saveConfig', async (_event, params: any) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      const id = FacebookAutoCommentService.getInstance().saveConfig(params);
+      return { success: true, id };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:deleteConfig', async (_event, { id }: { id: string }) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      FacebookAutoCommentService.getInstance().deleteConfig(id);
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:getLogs', async (_event, { configId, limit }: { configId: string; limit?: number }) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      const logs = FacebookAutoCommentService.getInstance().getLogs(configId, limit);
+      return { success: true, logs };
+    } catch (err: any) {
+      return { success: false, logs: [], error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:runNow', async (_event, { configId }: { configId: string }) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      const result = await FacebookAutoCommentService.getInstance().runNow(configId);
+      if (!result.success) {
+        return { success: false, error: result.errors?.[0] || 'Auto comment chạy thất bại', ...result };
+      }
+      return { success: true, ...result };
+    } catch (err: any) {
+      Logger.error(`[facebookIpc] fb:autoComment:runNow error: ${err.message}\n${err.stack || ''}`);
+      return { success: false, error: err.message };
+    }
+  });
+
+  // ─── New multi-account/job APIs ─────────────────────────────────────────────
+
+  ipcMain.handle('fb:autoComment:runJob', async (_event, { configId }: { configId: string }) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      const jobId = await FacebookAutoCommentService.getInstance().runJobNow(configId);
+      return { success: true, jobId: jobId.jobId };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:cancelJob', async (_event, { jobId }: { jobId: string }) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      return FacebookAutoCommentService.getInstance().cancelJob(jobId);
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:stopFlow', async (_event, { configId }: { configId: string }) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      return { success: true, ...FacebookAutoCommentService.getInstance().stopFlow(configId) };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:getJobs', async (_event, params: { configId?: string; accountId?: string; limit?: number } = {}) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      const jobs = FacebookAutoCommentService.getInstance().getJobs(params || {});
+      return { success: true, jobs };
+    } catch (err: any) {
+      return { success: false, jobs: [], error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:getJobLogs', async (_event, { jobId, limit }: { jobId: string; limit?: number }) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      const logs = FacebookAutoCommentService.getInstance().getJobLogs(jobId, limit);
+      return { success: true, logs };
+    } catch (err: any) {
+      return { success: false, logs: [], error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:getWorkerStatus', async () => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      return { success: true, status: FacebookAutoCommentService.getInstance().getWorkerStatus() };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:checkAccountSession', async (_event, { accountId }: { accountId: string }) => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      const result = await FacebookAutoCommentService.getInstance().checkAccountSession(accountId);
+      return { success: true, ...result };
+    } catch (err: any) {
+      return { success: false, state: 'unknown', error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:startWorker', async () => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      FacebookAutoCommentService.getInstance().start();
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:getStatus', async () => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      return { success: true, status: FacebookAutoCommentService.getInstance().getStatus() };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:autoComment:stopWorker', async () => {
+    try {
+      const { FacebookAutoCommentService } = require('../../src/services/facebook/FacebookAutoCommentService');
+      FacebookAutoCommentService.getInstance().stop();
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // ─── DEBUG: Dump decrypted cookie to file for DevTools inspection ───────────
+  // ponytail: Remove this after capturing doc_ids
+  ipcMain.handle('fb:debugDumpCookie', async (_event, { accountId }: { accountId: string }) => {
+    try {
+      const cookie = secureGet(fbCookieKey(accountId));
+      if (!cookie) return { success: false, error: 'No cookie for this account' };
+      const downloads = app.getPath('downloads');
+      const fileName = `deplao-cookie-${accountId.slice(0, 8)}-${Date.now()}.txt`;
+      const outPath = path.join(downloads, fileName);
+      fs.writeFileSync(outPath, `# Account: ${accountId}\n# Time: ${new Date().toISOString()}\n\n${cookie}\n`, 'utf8');
+      return { success: true, path: outPath };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // ─── DEBUG: Open Playwright Chromium với cookie đã lưu, giữ mở cho DevTools ─
+  // Multi-instance: mỗi account có browser riêng, không đóng browser account khác.
+  ipcMain.handle('fb:debugOpenBrowserWithCookie', async (_event, { accountId, startUrl }: { accountId: string; startUrl?: string }) => {
+    try {
+      const { BrowserDebugService } = require('../../src/services/facebook/BrowserDebugService');
+      const result = await BrowserDebugService.getInstance().openWithCookie({
+        accountId,
+        startUrl,
+        keepOpen: true,
+        headless: false,
+      });
+      return result;
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // accountId omitted → close all. accountId given → close only that one.
+  ipcMain.handle('fb:debugCloseBrowser', async (_event, { accountId }: { accountId?: string } = {}) => {
+    try {
+      const { BrowserDebugService } = require('../../src/services/facebook/BrowserDebugService');
+      await BrowserDebugService.getInstance().close(accountId);
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('fb:debug:listOpenBrowsers', async () => {
+    try {
+      const { BrowserDebugService } = require('../../src/services/facebook/BrowserDebugService');
+      return { success: true, accountIds: BrowserDebugService.getInstance().listOpen() };
+    } catch (err: any) {
+      return { success: false, accountIds: [], error: err.message };
     }
   });
 

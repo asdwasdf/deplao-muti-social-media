@@ -14,6 +14,19 @@ export interface FBSessionData {
   FacebookID: string;
   clientRevision: string;
   cookieFacebook: string;
+  // ─── Modern GraphQL — all optional, parse best-effort ──────────────
+  /** LSD token — critical for GraphQL, thiếu = 1357054. Session-scoped. */
+  lsd?: string;
+  /** ServerNonce from homepage — used for __s param. */
+  serverNonce?: string;
+  /** SprinkleConfig blob — used for __hsdp/__hblp if needed. */
+  sprinkleConfig?: string;
+  /** MercuryServerRequestsConfig — used for polling params. */
+  mercuryServerRequestsConfig?: string;
+  /** Server revision — separate from clientRevision. */
+  serverRevision?: string;
+  /** USID metadata — required to keep LSD valid. */
+  usidMetadata?: string;
 }
 
 export interface FBLoginResult {

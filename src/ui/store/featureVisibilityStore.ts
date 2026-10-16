@@ -8,7 +8,8 @@ export type FeatureVisibilityKey =
   | 'integration'
   | 'analytics'
   | 'erp'
-  | 'settings';
+  | 'settings'
+  | 'autocomment';
 
 const STORAGE_KEY = 'deplao:sidebar-feature-visibility';
 
@@ -21,6 +22,7 @@ const DEFAULT_VISIBILITY: Record<FeatureVisibilityKey, boolean> = {
   analytics: true,
   erp: true,
   settings: true,
+  autocomment: true,
 };
 
 function loadVisibility(): Record<FeatureVisibilityKey, boolean> {

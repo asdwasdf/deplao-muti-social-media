@@ -47,6 +47,7 @@ const WorkflowPage = React.lazy(() => import('./components/workflow/WorkflowPage
 const IntegrationPage = React.lazy(() => import('./components/integration/IntegrationPage'));
 const AnalyticsPage = React.lazy(() => import('./components/analytics/AnalyticsPage'));
 const ErpPage = React.lazy(() => import('./features/erp/ErpPage'));
+const AutoCommentView = React.lazy(() => import('./features/autocomment/AutoCommentView'));
 
 const HEALTH_CHECK_INTERVAL_MS = 60 * 1000; // 1 phút
 const NETWORK_RECONNECT_COOLDOWN_MS = 15 * 1000; // 15 giây
@@ -254,7 +255,7 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const wsRes = await ipc.workspace?.getActive();
+        const wsRes = await ipc.workspace?.getActive?.();
         const ws = wsRes?.workspace;
         if (ws?.type === 'remote' && ws.bossUrl && ws.token) {
           const mod = await import('../services/http/RestQueryService');
@@ -263,7 +264,9 @@ export default function App() {
             console.log(`[App] ⚡ Early RestQueryService init: ${ws.bossUrl}`);
           }
         }
-      } catch {}
+      } catch (err) {
+        console.warn('[App] Early RestQueryService init failed:', err);
+      }
     })();
   }, []);
 
@@ -1598,6 +1601,7 @@ export default function App() {
             {view === 'integration' && <div className="flex-1 h-full overflow-hidden"><IntegrationPage /></div>}
             {view === 'analytics' && <div className="flex-1 h-full overflow-hidden"><AnalyticsPage /></div>}
             {view === 'erp' && <div className="flex-1 h-full overflow-hidden"><ErpPage /></div>}
+            {view === 'autocomment' && <div className="flex-1 h-full overflow-hidden"><AutoCommentView /></div>}
             {view === 'dashboard' && <Dashboard />}
           </Suspense>
         </div>

@@ -466,6 +466,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     startMessengerLiteLogin: (params: { proxyId?: number | null }) => ipcRenderer.invoke('fb:startMessengerLiteLogin', params),
     submitMessengerLiteLogin: (params: { sessionId: string; input: Record<string, string>; proxyId?: number | null }) => ipcRenderer.invoke('fb:submitMessengerLiteLogin', params),
     cancelMessengerLiteLogin: (params: { sessionId: string }) => ipcRenderer.invoke('fb:cancelMessengerLiteLogin', params),
+    startBrowserLogin: (params: { proxyId?: number | null; headless?: boolean }) => ipcRenderer.invoke('fb:startBrowserLogin', params),
+    cancelBrowserLogin: (params: { sessionId: string }) => ipcRenderer.invoke('fb:cancelBrowserLogin', params),
+    onBrowserLoginEvent: (cb: (data: { sessionId: string; event: any }) => void) => {
+      const handler = (_e: any, payload: any) => cb(payload);
+      ipcRenderer.on('fb:browserLoginEvent', handler);
+      return () => ipcRenderer.removeListener('fb:browserLoginEvent', handler);
+    },
     removeAccount:       (params: { accountId: string }) => ipcRenderer.invoke('fb:removeAccount', params),
     updateCookie:        (params: { accountId: string; cookie: string }) => ipcRenderer.invoke('fb:updateCookie', params),
     refreshProfile:      (params: { accountId: string }) => ipcRenderer.invoke('fb:refreshProfile', params),
@@ -536,6 +543,32 @@ contextBridge.exposeInMainWorld('electronAPI', {
     scanGetRequestLogs:(params: { tabId: string; limit?: number; offset?: number }) => ipcRenderer.invoke('fb:scanGetRequestLogs', params),
     scanGetStats:      (params: { accountId: string }) => ipcRenderer.invoke('fb:scanGetStats', params),
     scanResetCache:() => ipcRenderer.invoke('fb:scanResetCache'),
+  },
+
+  // ─── Auto Comment ─────────────────────────────────────────────────────
+  autoComment: {
+    getConfigs:() => ipcRenderer.invoke('fb:autoComment:getConfigs'),
+    getConfig:(params: { id: string }) => ipcRenderer.invoke('fb:autoComment:getConfig', params),
+    saveConfig:(params: any) => ipcRenderer.invoke('fb:autoComment:saveConfig', params),
+    deleteConfig:(params: { id: string }) => ipcRenderer.invoke('fb:autoComment:deleteConfig', params),
+    getLogs:(params: { configId: string; limit?: number }) => ipcRenderer.invoke('fb:autoComment:getLogs', params),
+    runNow:(params: { configId: string }) => ipcRenderer.invoke('fb:autoComment:runNow', params),
+    startWorker:() => ipcRenderer.invoke('fb:autoComment:startWorker'),
+    stopWorker:() => ipcRenderer.invoke('fb:autoComment:stopWorker'),
+    getStatus:() => ipcRenderer.invoke('fb:autoComment:getStatus'),
+    // Multi-account / job APIs
+    runJob:(params: { configId: string }) => ipcRenderer.invoke('fb:autoComment:runJob', params),
+    cancelJob:(params: { jobId: string }) => ipcRenderer.invoke('fb:autoComment:cancelJob', params),
+    stopFlow:(params: { configId: string }) => ipcRenderer.invoke('fb:autoComment:stopFlow', params),
+    getJobs:(params?: { configId?: string; accountId?: string; limit?: number }) => ipcRenderer.invoke('fb:autoComment:getJobs', params || {}),
+    getJobLogs:(params: { jobId: string; limit?: number }) => ipcRenderer.invoke('fb:autoComment:getJobLogs', params),
+    getWorkerStatus:() => ipcRenderer.invoke('fb:autoComment:getWorkerStatus'),
+    checkAccountSession:(params: { accountId: string }) => ipcRenderer.invoke('fb:autoComment:checkAccountSession', params),
+    // Browser debug
+    debugDumpCookie:(params: { accountId: string }) => ipcRenderer.invoke('fb:debugDumpCookie', params),
+    debugOpenBrowserWithCookie:(params: { accountId: string; startUrl?: string }) => ipcRenderer.invoke('fb:debugOpenBrowserWithCookie', params),
+    debugCloseBrowser:(params?: { accountId?: string }) => ipcRenderer.invoke('fb:debugCloseBrowser', params || {}),
+    debugListOpenBrowsers:() => ipcRenderer.invoke('fb:debug:listOpenBrowsers'),
   },
 
   // ─── Telegram Bot ───────────────────────────────────────────────────────

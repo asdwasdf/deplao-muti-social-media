@@ -3,7 +3,7 @@ import { useAccountStore } from './accountStore';
 import { useEmployeeStore } from './employeeStore';
 import DataAccessor from '@/lib/data/DataAccessor';
 
-type AppView = 'chat' | 'friends' | 'settings' | 'dashboard' | 'crm' | 'workflow' | 'integration' | 'analytics' | 'erp';
+type AppView = 'chat' | 'friends' | 'settings' | 'dashboard' | 'crm' | 'workflow' | 'integration' | 'analytics' | 'erp' | 'autocomment';
 export type AppTheme = 'dark' | 'light';
 
 export interface GroupMember {

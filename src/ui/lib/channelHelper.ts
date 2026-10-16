@@ -24,8 +24,8 @@ export type ChannelKey = typeof CHANNEL[keyof typeof CHANNEL];
 
 // ─── Channel type checks ─────────────────────────────────────────────────────
 
-export function isZalo(ch?: string): boolean {
-  return (ch || CHANNEL.ZALO) === CHANNEL.ZALO;
+export function isZalo(ch?: string | null): boolean {
+  return ch === CHANNEL.ZALO || ch === 'zalo';
 }
 
 export function isFacebook(ch?: string): boolean {

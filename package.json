@@ -4,8 +4,9 @@
   "description": "Phần mềm desktop quản lý Zalo, Facebook & Telegram cá nhân Đa tài khoản tích hợp CRM, ERP, POS, Workflow và AI Assistant giúp đội nhóm bán hàng, chăm sóc khách hàng và marketing trên Zalo vận hành tập trung trong một ứng dụng duy nhất.",
   "main": "dist-electron/electron/bootstrap.js",
   "scripts": {
-    "postinstall": "node scripts/patch-electron-icon.js",
+    "postinstall": "node scripts/patch-electron-icon.js && node scripts/postinstall-playwright.js || echo 'WARN: postinstall setup incomplete'",
     "patch-icon": "node scripts/patch-electron-icon.js",
+    "install:playwright": "node scripts/postinstall-playwright.js && node scripts/copy-playwright-browser.js",
     "build:bridge-e2ee": "node scripts/build-bridge-e2ee.js",
     "predev": "node scripts/build-bridge-e2ee.js --fast || echo 'WARN: E2EE bridge build failed, app will work without E2EE'",
     "dev": "npm run build:electron && concurrently -n VITE,TSC,ELECTRON -c cyan,magenta,yellow \"vite\" \"tsc -p tsconfig.electron.json --watch --preserveWatchOutput\" \"wait-on http://localhost:27799 && cross-env NODE_ENV=development electron dist-electron/electron/bootstrap.js\"",
@@ -18,12 +19,12 @@
   "homepage": "https://deplaoapp.com",
   "license": "MIT",
   "dependencies": {
+    "@ngrok/ngrok": "^1.7.0",
     "axios": "^1.7.8",
     "axios-cookiejar-support": "^5.0.3",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^12.9.0",
     "bytenode": "^1.5.7",
-    "@ngrok/ngrok": "^1.7.0",
     "cloudflared": "^0.7.1",
     "dompurify": "^3.4.1",
     "electron-store": "^8.2.0",
@@ -40,6 +41,7 @@
     "node-fetch": "^2.7.0",
     "nodemailer": "^8.0.3",
     "otplib": "^13.4.0",
+    "playwright": "^1.64.0",
     "proxy-agent": "^8.0.1",
     "quill": "^2.0.3",
     "react-is": "^19.2.8",
@@ -127,6 +129,8 @@
       "node_modules/ffmpeg-static/**/*",
       "node_modules/@ngrok/ngrok/**/*",
       "node_modules/cloudflared/**/*",
+      "node_modules/playwright/**/*",
+      "playwright-browsers/**/*",
       "package.json"
     ],
     "asarUnpack": [
@@ -134,7 +138,9 @@
       "node_modules/@ngrok/ngrok/**",
       "node_modules/better-sqlite3/**",
       "node_modules/cloudflared/**",
-      "node_modules/ffmpeg-static/**"
+      "node_modules/ffmpeg-static/**",
+      "node_modules/playwright/**",
+      "playwright-browsers/**"
     ],
     "afterPack": "./scripts/after-pack.js",
     "win": {

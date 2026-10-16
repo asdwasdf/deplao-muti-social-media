@@ -10,6 +10,7 @@ import { Spinner } from '@/components/common/PageLoading';
 import { AlertIcon, BookIcon, CheckIcon, ClockIcon, CloseIcon, KeyIcon, LockIcon, PinIcon, PluginIcon, RefreshIcon, SmartphoneIcon, StarIcon, SunIcon, WrenchIcon } from '@/components/common/icons';
 import TelegramBotLoginStep from './TelegramBotLoginStep';
 import PhoneLoginTab from './PhoneLoginTab';
+import FacebookBrowserLoginTab from './FacebookBrowserLoginTab';
 
 interface AddAccountModalProps {
   onClose: () => void;
@@ -54,7 +55,7 @@ export default function AddAccountModal({ onClose }: AddAccountModalProps) {
   const [step, setStep] = useState<Step>(getInitialStep());
   const [channel, setChannel] = useState<Channel>(initialCh || 'zalo');
   const [tab, setTab] = useState<'qr' | 'cookie'>('qr');
-  const [fbTab, setFbTab] = useState<'messenger_lite' | 'cookie'>('messenger_lite');
+  const [fbTab, setFbTab] = useState<'messenger_lite' | 'cookie' | 'browser'>('messenger_lite');
   const [selectedProxyId, setSelectedProxyId] = useState<number | null>(null);
   const [proxies, setProxies] = useState<any[]>([]);
   const [proxyLoading, setProxyLoading] = useState(false);
@@ -262,7 +263,7 @@ export default function AddAccountModal({ onClose }: AddAccountModalProps) {
             )}
             {/* Facebook sub-tabs */}
             <div className="flex border-b border-gray-700">
-              {(['messenger_lite', 'cookie'] as const).map((t) => (
+              {(['messenger_lite', 'cookie', 'browser'] as const).map((t) => (
                 <button
                   key={t}
                   onClick={() => setFbTab(t)}
@@ -272,15 +273,17 @@ export default function AddAccountModal({ onClose }: AddAccountModalProps) {
                       : 'text-gray-400 hover:text-gray-200'
                   }`}
                 >
-                  {t === 'messenger_lite' ? 'Đăng nhập tài khoản' : 'Cookie'}
+                  {t === 'messenger_lite' ? 'Đăng nhập tài khoản' : t === 'cookie' ? 'Cookie' : 'Trình duyệt'}
                 </button>
               ))}
             </div>
             <div className="p-6">
               {fbTab === 'messenger_lite' ? (
                 <FacebookMessengerLiteLoginTab onSuccess={onClose} proxyId={selectedProxyId} />
-              ) : (
+              ) : fbTab === 'cookie' ? (
                 <FacebookCookieLoginTab onSuccess={onClose} proxyId={selectedProxyId} />
+              ) : (
+                <FacebookBrowserLoginTab onSuccess={onClose} proxyId={selectedProxyId} />
               )}
             </div>
           </>

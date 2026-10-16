@@ -1288,14 +1288,16 @@ class DatabaseService {
             CREATE TABLE IF NOT EXISTS fb_auto_comment_configs (
                 id                      TEXT PRIMARY KEY,
                 workspace_id            TEXT DEFAULT '',
-                account_id             TEXT NOT NULL,
-                comments               TEXT DEFAULT '[]',
-                group_ids              TEXT DEFAULT '[]',
-                max_posts_per_run      INTEGER DEFAULT 10,
-                schedule_minutes       INTEGER DEFAULT 60,
-                enabled                INTEGER DEFAULT 1,
-                created_at             INTEGER NOT NULL,
-                updated_at             INTEGER NOT NULL
+                account_id              TEXT NOT NULL,
+                comments                TEXT DEFAULT '[]',
+                group_ids               TEXT DEFAULT '[]',
+                max_posts_per_run       INTEGER DEFAULT 10,
+                schedule_minutes        INTEGER DEFAULT 60,
+                enabled                 INTEGER DEFAULT 1,
+                created_at              INTEGER NOT NULL,
+                updated_at              INTEGER NOT NULL,
+                comment_count_per_post  INTEGER DEFAULT NULL,
+                comment_pick_mode       TEXT DEFAULT 'sequential'
             );
             CREATE INDEX IF NOT EXISTS idx_fb_auto_comment_account ON fb_auto_comment_configs(account_id);
         `);
@@ -1307,6 +1309,22 @@ class DatabaseService {
         )?.some((c: any) => c.name === 'doc_id_create_comment');
         if (!hasDocIdCol) {
             this.exec(`ALTER TABLE fb_auto_comment_configs ADD COLUMN doc_id_create_comment TEXT DEFAULT NULL`);
+        }
+
+        // ponytail: comment-picking knobs. comment_count_per_post:
+        //   NULL → legacy (đăng tất cả mẫu). Number N → đăng tối đa N mẫu / bài.
+        // comment_pick_mode: 'sequential' (xoay vòng) | 'random' (không trùng trong 1 bài).
+        const hasPerPostCol = this.query<any>(
+            `PRAGMA table_info(fb_auto_comment_configs)`
+        )?.some((c: any) => c.name === 'comment_count_per_post');
+        if (!hasPerPostCol) {
+            this.exec(`ALTER TABLE fb_auto_comment_configs ADD COLUMN comment_count_per_post INTEGER DEFAULT NULL`);
+        }
+        const hasPickModeCol = this.query<any>(
+            `PRAGMA table_info(fb_auto_comment_configs)`
+        )?.some((c: any) => c.name === 'comment_pick_mode');
+        if (!hasPickModeCol) {
+            this.exec(`ALTER TABLE fb_auto_comment_configs ADD COLUMN comment_pick_mode TEXT DEFAULT 'sequential'`);
         }
 
         this.exec(`
@@ -1323,6 +1341,38 @@ class DatabaseService {
                 FOREIGN KEY (config_id) REFERENCES fb_auto_comment_configs(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_fb_auto_comment_logs_config ON fb_auto_comment_logs(config_id);
+        `);
+
+        // ponytail: job_id column added later — log row knows which job it belongs to.
+        // Logs inserted before this migration stay NULL → UI shows them under "Logs (legacy)".
+        const hasJobIdCol = this.query<any>(
+            `PRAGMA table_info(fb_auto_comment_logs)`
+        )?.some((c: any) => c.name === 'job_id');
+        if (!hasJobIdCol) {
+            this.exec(`ALTER TABLE fb_auto_comment_logs ADD COLUMN job_id TEXT DEFAULT NULL`);
+            this.exec(`CREATE INDEX IF NOT EXISTS idx_fb_auto_comment_logs_job ON fb_auto_comment_logs(job_id)`);
+        }
+
+        // Per-execution job (one row per run of a flow). Scheduler/manual share the same table.
+        this.exec(`
+            CREATE TABLE IF NOT EXISTS fb_auto_comment_jobs (
+                id              TEXT PRIMARY KEY,
+                config_id       TEXT NOT NULL,
+                account_id      TEXT NOT NULL,
+                trigger         TEXT NOT NULL DEFAULT 'manual',
+                status          TEXT NOT NULL DEFAULT 'pending',
+                scheduled_at    INTEGER NOT NULL,
+                started_at      INTEGER,
+                ended_at        INTEGER,
+                posts_targeted  INTEGER DEFAULT 0,
+                comments_posted INTEGER DEFAULT 0,
+                error           TEXT DEFAULT '',
+                FOREIGN KEY (config_id) REFERENCES fb_auto_comment_configs(id) ON DELETE CASCADE,
+                FOREIGN KEY (account_id) REFERENCES fb_accounts(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_fb_auto_comment_jobs_account ON fb_auto_comment_jobs(account_id, status);
+            CREATE INDEX IF NOT EXISTS idx_fb_auto_comment_jobs_config  ON fb_auto_comment_jobs(config_id, scheduled_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fb_auto_comment_jobs_status  ON fb_auto_comment_jobs(status, scheduled_at);
         `);
 
         // ─── Proxies ─────────────────────────────────────────────────────────────
