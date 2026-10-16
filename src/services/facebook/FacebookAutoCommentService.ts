@@ -1130,31 +1130,41 @@ export function extractPostIdsFromWwwFeed(html: string, groupId: string): GroupP
   };
 
   // Tìm kiếm "đang ở trong comment subtree" cho anchor tại vị trí idx.
-  // Ý tưởng: scan ngược từ anchor, tìm comment-marker gần nhất, rồi đếm thẻ
-  // mở vs đóng (div/article) từ marker đó tới anchor. Nếu depth > 0 → anchor
-  // vẫn nằm trong comment subtree → bỏ. Nếu depth = 0 → đã thoát ra top-level.
-  // Đây là cách chính xác hơn "substring window": tránh false-positive khi
-  // comment subtree dài > 600 char (case thực tế FB có thể dài hơn nhiều).
+  // Ý tưởng: tìm comment-marker gần nhất trước anchor, lùi về `<tag` mở chứa
+  // marker đó, rồi đếm thẻ mở/đóng từ `<tag` đó tới anchor. Nếu depth > 0
+  // → anchor vẫn nằm trong comment subtree → bỏ.
   const COMMENT_MARKER = /(?:data-pagelet="[^"]*[Cc]omment[^"]*"|aria-label="[^"]*[Bb]ình luận[^"]*"|aria-label="[^"]*[Cc]omment[^"]*"|data-testid="[^"]*[Cc]omment[^"]*")/g;
   const OPEN_TAG = /<(div|article|section|aside)\b[^>]*>/g;
   const CLOSE_TAG = /<\/(div|article|section|aside)>/g;
 
   const isInCommentContext = (idx: number): boolean => {
-    // Tìm comment-marker gần nhất trước anchor.
+    // 1. Tìm comment-marker gần nhất trước anchor.
     COMMENT_MARKER.lastIndex = 0;
-    let lastMarkerEnd = -1;
+    let lastMarkerIdx = -1;
     let mk: RegExpExecArray | null;
     while ((mk = COMMENT_MARKER.exec(html)) !== null) {
       if (mk.index >= idx) break;
-      lastMarkerEnd = mk.index + mk[0].length;
+      lastMarkerIdx = mk.index;
     }
-    if (lastMarkerEnd < 0) return false;
+    if (lastMarkerIdx < 0) return false;
 
-    // Đếm thẻ mở/đóng từ lastMarkerEnd tới idx. Depth > 0 ⇒ vẫn trong subtree.
+    // 2. Lùi từ marker về `<tag` mở gần nhất chứa nó. Đây là thẻ "gốc" của
+    //    comment subtree. Nếu không tìm thấy (self-closing / marker ở thẻ khác),
+    //    fallback về vị trí marker.
+    OPEN_TAG.lastIndex = 0;
+    let enclosingOpenIdx = -1;
+    let openM: RegExpExecArray | null;
+    while ((openM = OPEN_TAG.exec(html)) !== null) {
+      if (openM.index >= lastMarkerIdx) break;
+      enclosingOpenIdx = openM.index;
+    }
+    const startFrom = enclosingOpenIdx >= 0 ? enclosingOpenIdx : lastMarkerIdx;
+
+    // 3. Đếm thẻ mở/đóng từ startFrom tới idx.
     let depth = 0;
-    OPEN_TAG.lastIndex = lastMarkerEnd;
-    CLOSE_TAG.lastIndex = lastMarkerEnd;
-    let openM: RegExpExecArray | null = OPEN_TAG.exec(html);
+    OPEN_TAG.lastIndex = startFrom;
+    CLOSE_TAG.lastIndex = startFrom;
+    openM = OPEN_TAG.exec(html);
     let closeM: RegExpExecArray | null = CLOSE_TAG.exec(html);
     while ((openM && openM.index < idx) || (closeM && closeM.index < idx)) {
       const nextOpen = openM ? openM.index : Infinity;
@@ -1164,7 +1174,7 @@ export function extractPostIdsFromWwwFeed(html: string, groupId: string): GroupP
         openM = OPEN_TAG.exec(html);
       } else {
         depth--;
-        if (depth <= 0) return false; // đã thoát ra top-level trước anchor
+        if (depth <= 0) return false; // đã đóng subtree trước anchor
         closeM = CLOSE_TAG.exec(html);
       }
     }
@@ -1185,8 +1195,8 @@ export function extractPostIdsFromWwwFeed(html: string, groupId: string): GroupP
   }
 
   const fallbackPatterns: RegExp[] = [
-    /story_fbid(?:=|%3D)(\d+)/g,
-    /fbid(?:=|%3D)(\d+)/g,
+    /story_fbid(?:=|%3D|":\s*)(\d+)/g,
+    /fbid(?:=|%3D|":\s*)(\d+)/g,
     /"post_id"\s*:\s*"?(\d+)"?/g,
   ];
   for (const re of fallbackPatterns) {
