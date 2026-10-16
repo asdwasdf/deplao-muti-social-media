@@ -29,6 +29,10 @@ async function getPlaywright(): Promise<PlaywrightModule> {
 
 const FB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 
+export function isFacebookContentUnavailable(text: string): boolean {
+  return /Bạn hiện không xem được nội dung này|This content isn't available/i.test(text);
+}
+
 export interface OpenBrowserOptions {
   accountId: string;
   startUrl?: string;
@@ -41,6 +45,22 @@ export interface OpenBrowserResult {
   url?: string;
   alreadyOpen?: boolean;
   error?: string;
+}
+
+export interface RenderedPageResult {
+  success: boolean;
+  html?: string;
+  url?: string;
+  title?: string;
+  feedReady?: boolean;
+  graphqlQueries?: Array<{ name: string; docId: string }>;
+  error?: string;
+}
+
+export interface RenderPageOptions {
+  maxScrolls?: number;
+  scrollDelayMs?: number;
+  stableScrolls?: number;
 }
 
 interface BrowserRecord {
@@ -156,6 +176,109 @@ export class BrowserDebugService {
       try { if (context) await context.close().catch(() => {}); } catch {}
       try { if (browser) await browser.close().catch(() => {}); } catch {}
       return { success: false, error: err.message };
+    }
+  }
+
+  /** Render one authenticated page in an isolated headless browser, then close it. */
+  async renderWithCookie(
+    accountId: string,
+    url: string,
+    options: RenderPageOptions = {},
+  ): Promise<RenderedPageResult> {
+    const cookieString = secureGet(fbCookieKey(accountId));
+    if (!cookieString) return { success: false, error: `Không có cookie cho account ${accountId}` };
+
+    let browser: any;
+    let context: any;
+    try {
+      const playwright = await getPlaywright();
+      const browserPath = resolvePlaywrightBrowserPath();
+      if (!browserPath) return { success: false, error: 'Không tìm thấy Playwright Chromium binary.' };
+
+      browser = await playwright.chromium.launch({
+        executablePath: browserPath,
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-blink-features=AutomationControlled',
+          '--ignore-certificate-errors',
+        ],
+      });
+      context = await browser.newContext({
+        userAgent: FB_USER_AGENT,
+        locale: 'vi-VN',
+        viewport: { width: 1366, height: 768 },
+        timezoneId: 'Asia/Ho_Chi_Minh',
+      });
+      const cookies = cookieString.split('; ').filter(Boolean).flatMap((pair) => {
+        const idx = pair.indexOf('=');
+        if (idx <= 0) return [];
+        return [{
+          name: pair.slice(0, idx),
+          value: decodeURIComponent(pair.slice(idx + 1)),
+          domain: '.facebook.com',
+          path: '/',
+          secure: true,
+          httpOnly: false,
+          sameSite: 'None' as const,
+        }];
+      });
+      await context.addCookies(cookies);
+      const page = await context.newPage();
+      const graphqlQueries = new Map<string, string>();
+      page.on('request', (request: any) => {
+        if (!request.url().includes('/api/graphql/')) return;
+        const body = request.postData() || '';
+        const params = new URLSearchParams(body);
+        const name = params.get('fb_api_req_friendly_name') || '';
+        const docId = params.get('doc_id') || '';
+        if (name && docId) graphqlQueries.set(name, docId);
+      });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      let feedReady = true;
+      try {
+        await page.waitForSelector('[role="feed"] [role="article"], [role="article"]', { timeout: 20000 });
+      } catch {
+        feedReady = false;
+      }
+
+      const maxScrolls = Math.max(0, options.maxScrolls || 0);
+      const stableLimit = Math.max(1, options.stableScrolls || 3);
+      let stable = 0;
+      let previousHeight = 0;
+      for (let i = 0; i < maxScrolls && stable < stableLimit; i++) {
+        const height = await page.evaluate('document.documentElement.scrollHeight');
+        await page.evaluate('window.scrollTo(0, document.documentElement.scrollHeight)');
+        await page.waitForTimeout(Math.max(250, options.scrollDelayMs || 1500));
+        const nextHeight = await page.evaluate('document.documentElement.scrollHeight');
+        stable = nextHeight <= height && nextHeight <= previousHeight ? stable + 1 : 0;
+        previousHeight = nextHeight;
+      }
+
+      const html = await page.content();
+      const bodyText = await page.locator('body').innerText().catch(() => '');
+      if (isFacebookContentUnavailable(bodyText)) {
+        return {
+          success: false,
+          url: page.url(),
+          title: await page.title(),
+          error: 'Tài khoản Facebook không có quyền xem group hoặc group không tồn tại.',
+        };
+      }
+      return {
+        success: true,
+        html,
+        url: page.url(),
+        title: await page.title(),
+        feedReady,
+        graphqlQueries: Array.from(graphqlQueries, ([name, docId]) => ({ name, docId })),
+      };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    } finally {
+      try { if (context) await context.close(); } catch {}
+      try { if (browser) await browser.close(); } catch {}
     }
   }
 

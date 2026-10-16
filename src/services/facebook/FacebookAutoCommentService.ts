@@ -13,6 +13,8 @@
 
 import DatabaseService from '../database/DatabaseService';
 import FacebookService from './FacebookService';
+import { FacebookScanService } from './FacebookScanService';
+import { BrowserDebugService } from './BrowserDebugService';
 import { secureGet } from '../secure/SecureSettingsService';
 import Logger from '../../utils/Logger';
 import { v4 as uuid } from 'uuid';
@@ -518,7 +520,8 @@ export class FacebookAutoCommentService {
     // Sequential: chỉ số chung cho cả job (xoay vòng giữa các bài).
     let seqCursor = 0;
 
-    // Lấy bài viết từ mỗi group
+    // Load replacement candidates too: skipped/failed posts must not consume success quota.
+    const candidateLimit = getAutoCommentCandidateLimit(config.max_posts_per_run);
     const allPosts: { groupId: string; groupName: string; posts: GroupPost[] }[] = [];
 
     for (const groupId of config.group_ids) {
@@ -529,7 +532,7 @@ export class FacebookAutoCommentService {
         return result;
       }
       try {
-        const posts = await this.getGroupPosts(service, groupId, config.max_posts_per_run);
+        const posts = await this.getGroupPosts(service, groupId, candidateLimit);
         const groupName = await this.getGroupName(service, groupId);
         if (posts.length > 0) {
           allPosts.push({ groupId, groupName, posts });
@@ -541,11 +544,13 @@ export class FacebookAutoCommentService {
     }
 
     // Flatten và sort (mới nhất trước)
-    const sortedPosts = allPosts
-      .flatMap(g => g.posts.map(p => ({ ...p, groupName: g.groupName })))
-      .sort((a, b) => b.timestamp - a.timestamp);
+    const sortedPosts = selectNewestGroupPosts(
+      allPosts.flatMap(g => g.posts.map(p => ({ ...p, groupName: g.groupName }))),
+      candidateLimit,
+    );
 
-    let postsCommented = 0;
+    let postsAttempted = 0;
+    let successfulPosts = 0;
 
     // Track posts đã comment để tránh spam cùng 1 post
     const commentedPosts = new Set<string>();
@@ -566,10 +571,11 @@ export class FacebookAutoCommentService {
         }
         break;
       }
-      if (postsCommented >= config.max_posts_per_run) break;
+      if (hasReachedAutoCommentTarget(successfulPosts, config.max_posts_per_run)) break;
       if (commentedPosts.has(post.postId)) continue;
 
-      // Kiểm tra đã comment bài này chưa (trong 24h)
+      // Top N was fixed before this loop. Recently handled posts are skipped,
+      // never replaced with older posts outside that newest-N set.
       if (await this.hasCommentedRecently(config.id, post.postId)) {
         Logger.log(`[FacebookAutoCommentService] Skipping post ${post.postId} - already commented recently`);
         continue;
@@ -584,7 +590,7 @@ export class FacebookAutoCommentService {
         perPost,
         mode: pickMode,
         seqCursor,
-        randomSeed: post.postId + ':' + postsCommented, // deterministic-ish per (post, slot) cho log
+        randomSeed: post.postId + ':' + postsAttempted, // deterministic-ish per (post, slot) cho log
       });
       // Cập nhật seqCursor cho sequential mode (xoay vòng giữa các bài).
       if (pickMode === 'sequential') {
@@ -634,43 +640,66 @@ export class FacebookAutoCommentService {
       this.saveLog(log, jobId);
       result.logs.push(log);
       commentedPosts.add(post.postId);
-      postsCommented++;
-      result.postsTargeted++;
+      postsAttempted++;
+      result.postsTargeted = postsAttempted;
+      if (postedComments.length > 0) successfulPosts++;
 
-      Logger.log(`[FacebookAutoCommentService] Commented ${postedComments.length} times on post ${post.postId} in group ${post.groupName}`);
+      Logger.log(
+        `[FacebookAutoCommentService] Commented ${postedComments.length} times on post ${post.postId} ` +
+        `in group ${post.groupName}; progress=${successfulPosts}/${config.max_posts_per_run}`
+      );
 
       // Delay giữa các bài viết
       await this.delay(3000);
     }
 
-    // Đánh dấu fail nếu không comment được bài nào — tránh báo "Hoàn thành" sai
-    if (result.commentsPosted === 0) {
+    if (!hasReachedAutoCommentTarget(successfulPosts, config.max_posts_per_run)) {
       result.success = false;
-      if (sortedPosts.length === 0) {
+      if (sortedPosts.length === 0 && result.errors.length === 0) {
         result.errors.push(
           `Không lấy được bài viết nào từ ${config.group_ids.length} group(s). ` +
-          `Có thể: group ID sai, doc ID GraphQL đã expired, hoặc tài khoản không có quyền truy cập.`
+          `Kiểm tra group ID và quyền xem group của tài khoản Facebook.`
         );
-      } else {
-        result.errors.push(`Đã tìm thấy ${sortedPosts.length} bài nhưng không comment được bài nào.`);
+      } else if (result.errors.length === 0) {
+        result.errors.push(
+          `Chỉ comment thành công ${successfulPosts}/${config.max_posts_per_run} bài; ` +
+          `đã hết ${sortedPosts.length} bài ứng viên.`
+        );
       }
     }
 
     return result;
   }
 
-  /** Lấy bài viết từ group - www endpoint (cookie work với www) */
+  /** Lấy bài viết mới nhất từ GraphQL; HTML chỉ là fallback cho markup cũ. */
   private async getGroupPosts(service: FacebookService, groupId: string, limit: number): Promise<GroupPost[]> {
     try {
-      const cookie = secureGet(fbCookieKey(service['accountId']));
+      const accountId = service['accountId'];
+      const scan = await FacebookScanService.getInstance().scanPostTimeline(accountId, groupId, 'group');
+      if (scan.success) {
+        const posts = normalizeScannedGroupPosts(scan.items, groupId, limit);
+        const response = scan._lastResponse || '';
+        Logger.log(
+          `[AutoComment] GraphQL group=${groupId} docId=${scan._lastDocId || 'none'} ` +
+          `items=${scan.items.length} posts=${posts.length} ` +
+          `signals={errors:${response.includes('"errors"')},node:${response.includes('"node"')},` +
+          `groupFeed:${response.includes('"group_feed"')},edges:${response.includes('"edges"')},` +
+          `postId:${response.includes('"post_id"')},story:${response.includes('"story"')}}`
+        );
+        if (posts.length >= limit) return posts;
+      } else {
+        Logger.warn(`[AutoComment] GraphQL group=${groupId} failed: ${scan.error || 'unknown error'}`);
+      }
+
+      const cookie = secureGet(fbCookieKey(accountId));
       if (!cookie) {
         Logger.error(`[AutoComment] No cookie for account ${service['accountId']}`);
         return [];
       }
 
-      // Dùng www endpoint — browser thường work với cookie này
-      // Thêm `?sk=wall` để bám feed thảo luận (sort by new posts)
-      const url = `https://www.facebook.com/groups/${groupId}/?sk=wall`;
+      // `sorting_setting=CHRONOLOGICAL` requests newest-first discussion feed.
+      // Publication timestamps are still parsed and sorted locally across groups.
+      const url = `https://www.facebook.com/groups/${groupId}/?sorting_setting=CHRONOLOGICAL`;
       const response = await axios.get(url, {
         headers: {
           'Cookie': cookie,
@@ -690,12 +719,37 @@ export class FacebookAutoCommentService {
 
       const html = String(response.data || '');
       const posts = this.parseWwwGroupFeed(html, groupId);
+      const count = (pattern: RegExp) => Array.from(html.matchAll(pattern)).length;
       Logger.log(
         `[AutoComment] www group=${groupId} status=${response.status} htmlLen=${html.length} ` +
-        `permalinkMatches=${posts.length} firstPid=${posts[0]?.postId || 'none'}`
+        `parsedPosts=${posts.length} firstPid=${posts[0]?.postId || 'none'} ` +
+        `signals={group:${count(new RegExp(groupId, 'g'))},permalink:${count(/(?:\/|\\\/)permalink(?:\/|\\\/)/g)},` +
+        `posts:${count(/(?:\/|\\\/)posts(?:\/|\\\/)/g)},storyFbid:${count(/story_fbid/g)},postId:${count(/post_id/g)}}`
       );
 
-      if (posts.length > 0) return posts.slice(0, limit);
+      if (posts.length >= limit) return selectNewestGroupPosts(posts, limit);
+
+      const rendered = await BrowserDebugService.getInstance().renderWithCookie(accountId, url, {
+        maxScrolls: Math.min(30, Math.max(6, limit)),
+        scrollDelayMs: 1500,
+        stableScrolls: 4,
+      });
+      if (rendered.success && rendered.html) {
+        const renderedPosts = this.parseWwwGroupFeed(rendered.html, groupId);
+        Logger.log(
+          `[AutoComment] browser group=${groupId} url=${rendered.url || 'none'} ` +
+          `title=${JSON.stringify(rendered.title || '')} feedReady=${!!rendered.feedReady} ` +
+          `htmlLen=${rendered.html.length} posts=${renderedPosts.length} ` +
+          `firstPid=${renderedPosts[0]?.postId || 'none'} ` +
+          `queries=${JSON.stringify(rendered.graphqlQueries || [])}`
+        );
+        const mergedPosts = selectNewestGroupPosts([...posts, ...renderedPosts], limit);
+        if (mergedPosts.length > 0) return mergedPosts;
+      } else {
+        const error = rendered.error || 'unknown error';
+        Logger.warn(`[AutoComment] browser group=${groupId} failed: ${error}`);
+        if (error.includes('không có quyền xem group')) throw new Error(error);
+      }
 
       // Diagnostic — detect login page (tight check, không match incidental text trong HTML)
       const isLogin = /<form[^>]*action="[^"]*login\.php/i.test(html)
@@ -708,7 +762,7 @@ export class FacebookAutoCommentService {
         Logger.log(`[AutoComment] www HTML title: "${titleMatch?.[1] || 'no title'}"`);
       }
 
-      return [];
+      return selectNewestGroupPosts(posts, limit);
     } catch (err: any) {
       Logger.error(
         `[AutoComment] getGroupPosts error for group=${groupId}: ${err.message}. ` +
@@ -1106,11 +1160,43 @@ export class FacebookAutoCommentService {
   }
 }
 
+export function getAutoCommentCandidateLimit(target: number): number {
+  return Math.max(0, target) * 3;
+}
+
+export function hasReachedAutoCommentTarget(successfulPosts: number, target: number): boolean {
+  return successfulPosts >= Math.max(0, target);
+}
+
 interface GroupPost {
   postId: string;
   groupId: string;
   groupName: string;
   timestamp: number;
+}
+
+export function normalizeScannedGroupPosts(items: any[], groupId: string, limit: number): GroupPost[] {
+  const now = Date.now();
+  return selectNewestGroupPosts(items.flatMap((item, index) => {
+    const postId = String(item?.postId || '').trim();
+    if (!/^\d+$/.test(postId)) return [];
+    const raw = Number(item?.timestamp);
+    const parsed = raw > 0 && raw < 10_000_000_000 ? raw * 1000 : raw;
+    const timestamp = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : now - index;
+    return [{ postId, groupId, groupName: '', timestamp }];
+  }), limit);
+}
+
+/** Select N newest unique posts across all configured groups. */
+export function selectNewestGroupPosts(posts: GroupPost[], limit: number): GroupPost[] {
+  const newestById = new Map<string, GroupPost>();
+  for (const post of posts) {
+    const previous = newestById.get(post.postId);
+    if (!previous || post.timestamp > previous.timestamp) newestById.set(post.postId, post);
+  }
+  return Array.from(newestById.values())
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, Math.max(0, limit));
 }
 
 /**
@@ -1123,10 +1209,10 @@ export function extractPostIdsFromWwwFeed(html: string, groupId: string): GroupP
   const posts: GroupPost[] = [];
   const seen = new Set<string>();
 
-  const push = (postId: string) => {
+  const push = (postId: string, timestamp: number) => {
     if (seen.has(postId) || postId === groupId) return;
     seen.add(postId);
-    posts.push({ postId, groupId, groupName: '', timestamp: Date.now() });
+    posts.push({ postId, groupId, groupName: '', timestamp });
   };
 
   // Tìm kiếm "đang ở trong comment subtree" cho anchor tại vị trí idx.
@@ -1181,36 +1267,55 @@ export function extractPostIdsFromWwwFeed(html: string, groupId: string): GroupP
     return depth > 0;
   };
 
-  const permRe = /\/groups\/\d+\/permalink\/(\d+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = permRe.exec(html)) !== null) {
-    if (isInCommentContext(m.index)) continue;
-    push(m[1]);
-  }
-
-  const postsRe = /\/groups\/\d+\/posts\/(\d+)/g;
-  while ((m = postsRe.exec(html)) !== null) {
-    if (isInCommentContext(m.index)) continue;
-    push(m[1]);
-  }
-
-  const fallbackPatterns: RegExp[] = [
-    /story_fbid(?:=|%3D|":\s*)(\d+)/g,
-    /fbid(?:=|%3D|":\s*)(\d+)/g,
-    /"post_id"\s*:\s*"?(\d+)"?/g,
+  // Facebook embeds feed URLs both normally and JSON-escaped (`\/groups\/...`).
+  // Only IDs coupled to this exact group URL are safe post IDs. Generic fields
+  // such as actorID, fbid, post_id and id also describe users/tracking objects.
+  const groupPath = String(groupId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const timestampPattern = /["'](?:creation_time|publish_time|created_time|creation_timestamp)["']\s*:\s*["']?(\d{10,13})/g;
+  const directPatterns = [
+    new RegExp(`(?:/|\\\\/)groups(?:/|\\\\/)${groupPath}(?:/|\\\\/)permalink(?:/|\\\\/)(\\d+)`, 'g'),
+    new RegExp(`(?:/|\\\\/)groups(?:/|\\\\/)${groupPath}(?:/|\\\\/)posts(?:/|\\\\/)(\\d+)`, 'g'),
   ];
-  for (const re of fallbackPatterns) {
+  const candidates: Array<{ postId: string; index: number }> = [];
+  let m: RegExpExecArray | null;
+  for (const re of directPatterns) {
     while ((m = re.exec(html)) !== null) {
-      push(m[1]);
+      if (!isInCommentContext(m.index)) candidates.push({ postId: m[1], index: m.index });
     }
   }
+  candidates.sort((a, b) => a.index - b.index);
 
-  if (posts.length === 0) {
-    const idRe = /"id"\s*:\s*"(\d{10,})"/g;
-    while ((m = idRe.exec(html)) !== null) {
-      push(m[1]);
-      if (posts.length >= 30) break;
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    // Bound metadata by adjacent post URLs, then use nearest publication field.
+    // This prevents one story's timestamp from being reused by the next story.
+    const start = Math.max(
+      candidate.index - 2000,
+      i > 0 ? Math.floor((candidates[i - 1].index + candidate.index) / 2) : 0,
+    );
+    const end = Math.min(
+      candidate.index + 2000,
+      i + 1 < candidates.length
+        ? Math.floor((candidate.index + candidates[i + 1].index) / 2)
+        : html.length,
+    );
+    const metadata = html.slice(start, end);
+    const relativeIndex = candidate.index - start;
+    timestampPattern.lastIndex = 0;
+    let timestampMatch: RegExpExecArray | null;
+    let nearest: { raw: string; distance: number } | null = null;
+    while ((timestampMatch = timestampPattern.exec(metadata)) !== null) {
+      const distance = Math.abs(timestampMatch.index - relativeIndex);
+      if (!nearest || distance < nearest.distance) nearest = { raw: timestampMatch[1], distance };
     }
+    const value = Number(nearest?.raw);
+    const parsedTimestamp = nearest?.raw.length === 10 ? value * 1000 : value;
+    const timestamp = Number.isSafeInteger(parsedTimestamp)
+      && parsedTimestamp > 0
+      && parsedTimestamp <= Date.now() + 24 * 60 * 60 * 1000
+      ? parsedTimestamp
+      : Date.now() - i;
+    push(candidate.postId, timestamp);
   }
 
   return posts;

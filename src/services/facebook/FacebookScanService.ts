@@ -173,7 +173,7 @@ function webSessionGetId(serverNonce?: string): string {
  * Parse GraphQL response, xử lý for(;;); prefix.
  * Nhận cả string (axios trả về text) và object (axios tự parse JSON).
  */
-function parseGraphQLResponse(response: any, functionName: string = ''): any {
+export function parseGraphQLResponse(response: any, functionName: string = ''): any {
   try {
     let data: any;
 
@@ -200,6 +200,15 @@ function parseGraphQLResponse(response: any, functionName: string = ''): any {
 
     if (!data) {
       return { data: null, error: 'Empty response' };
+    }
+
+    // GraphQL may return HTTP 200 with top-level `errors` and no usable data.
+    if (Array.isArray(data?.errors) && data.errors.length > 0) {
+      const errorMsg = data.errors
+        .map((error: any) => error?.message || error?.description || String(error))
+        .join('; ');
+      logError(`[${functionName}] GraphQL errors: ${errorMsg}`);
+      return { data: null, error: errorMsg };
     }
 
     // Kiểm tra lỗi từ Facebook - nhiều format khác nhau
@@ -1839,6 +1848,8 @@ export class FacebookScanService {
     if (!docId) {
       docId = await this.loadDocId(profileUrl, { type: docType }, cookie) || '';
     }
+    // ponytail: static fallback only covers current group-feed query; refresh when Meta rejects this doc ID.
+    if (!docId && sourceType === 'group') docId = '28295952946774461';
     if (!docId) {
       return { success: false, items: [], pageInfo: { endCursor: null, hasNextPage: false }, error: 'Cannot load docId for ' + sourceType + ' timeline.' };
     }
