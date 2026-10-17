@@ -9,6 +9,7 @@ agents/
 .env
 .env.local
 .env.production
+scripts/.env.fb-android
 *.log
 data/*
 .DS_Store
