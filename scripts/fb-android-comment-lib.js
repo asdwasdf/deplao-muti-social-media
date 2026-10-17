@@ -70,17 +70,21 @@ function xpathLiteral(value) {
 
 function selectorsForText(value, exact = false) {
   const literal = xpathLiteral(value);
-  if (exact) return [`xpath=//*[@text=${literal} or @content-desc=${literal}]`];
+  if (exact) return [`//*[@text=${literal} or @content-desc=${literal}]`];
   return [
-    `xpath=//*[@text=${literal} or @content-desc=${literal}]`,
-    `xpath=//*[contains(@text, ${literal}) or contains(@content-desc, ${literal})]`,
+    `//*[@text=${literal} or @content-desc=${literal}]`,
+    `//*[contains(@text, ${literal}) or contains(@content-desc, ${literal})]`,
   ];
 }
 
 function selectorCandidates(role, locale, nickname) {
-  if (role === 'nickname') {
+  if (role === 'nickname' || role === 'selectedNickname') {
     if (!nickname?.trim()) throw new Error('Nickname selector requires a value');
-    return selectorsForText(nickname.trim(), true);
+    const [selector] = selectorsForText(nickname.trim(), true);
+    if (role === 'selectedNickname') {
+      return [`${selector}[ancestor-or-self::*[@checked='true' or @selected='true']]`];
+    }
+    return [selector];
   }
   if (!TEXT[role]) throw new Error(`Unknown selector role: ${role}`);
   const alternate = locale === 'vi' ? 'en' : 'vi';
@@ -97,8 +101,12 @@ function isExpectedPackage(currentPackage, expectedPackage) {
   return currentPackage === expectedPackage;
 }
 
-function isSubmissionConfirmed(commentFieldExists) {
-  return commentFieldExists === false;
+function isIdentitySelectionConfirmed(selectedNicknameExists) {
+  return selectedNicknameExists === true;
+}
+
+function isSubmissionConfirmed({ commentFieldExists, postedCommentVisible }) {
+  return commentFieldExists === false && postedCommentVisible === true;
 }
 
 module.exports = {
@@ -109,5 +117,6 @@ module.exports = {
   selectorCandidates,
   detectBlockingScreen,
   isExpectedPackage,
+  isIdentitySelectionConfirmed,
   isSubmissionConfirmed,
 };

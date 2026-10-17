@@ -9,6 +9,7 @@ const {
   selectorCandidates,
   detectBlockingScreen,
   isExpectedPackage,
+  isIdentitySelectionConfirmed,
   isSubmissionConfirmed,
 } = require('./fb-android-comment-lib');
 
@@ -41,7 +42,7 @@ async function findFirst(driver, selectors, timeoutMs, role) {
     for (const selector of selectors) {
       try {
         const element = await driver.$(selector);
-        if (await element.isExisting()) return element;
+        if (await element.isExisting() && await element.isDisplayed() && await element.isEnabled()) return element;
       } catch (error) { lastError = error; }
     }
     await driver.pause(500);
@@ -71,7 +72,19 @@ async function saveArtifacts(driver, dir, suffix, includeXml) {
 
 async function elementExists(driver, selectors) {
   for (const selector of selectors) {
-    try { if (await (await driver.$(selector)).isExisting()) return true; } catch {}
+    try {
+      const element = await driver.$(selector);
+      if (await element.isExisting() && await element.isDisplayed()) return true;
+    } catch {}
+  }
+  return false;
+}
+
+async function waitFor(driver, predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await driver.pause(500);
   }
   return false;
 }
@@ -119,9 +132,18 @@ async function main() {
     const identityButton = await findFirst(driver, selectorCandidates('identityButton', config.locale), config.timeoutMs, 'identity selector');
     await identityButton.click();
     await assertNotBlocked(driver);
-    const nickname = await findFirst(driver, selectorCandidates('nickname', config.locale, input.nickname), config.timeoutMs, 'requested nickname');
+    const nicknameSelectors = selectorCandidates('nickname', config.locale, input.nickname);
+    const nickname = await findFirst(driver, nicknameSelectors, config.timeoutMs, 'requested nickname');
     await nickname.click();
     await assertNotBlocked(driver);
+    const reopenIdentityButton = await findFirst(driver, selectorCandidates('identityButton', config.locale), config.timeoutMs, 'identity selector');
+    await reopenIdentityButton.click();
+    const selectedNickname = selectorCandidates('selectedNickname', config.locale, input.nickname);
+    if (!isIdentitySelectionConfirmed(await elementExists(driver, selectedNickname))) {
+      throw new Error('Could not confirm requested nickname selection');
+    }
+    const closeIdentityButton = await findFirst(driver, selectorCandidates('identityButton', config.locale), config.timeoutMs, 'identity selector');
+    await closeIdentityButton.click();
 
     const fieldSelectors = selectorCandidates('commentField', config.locale);
     const field = await findFirst(driver, fieldSelectors, config.timeoutMs, 'comment field');
@@ -142,10 +164,12 @@ async function main() {
     const postButton = await findFirst(driver, selectorCandidates('postButton', config.locale), config.timeoutMs, 'post button');
     if (!await postButton.isEnabled()) throw new Error('Post button is disabled');
     await postButton.click();
-    await driver.pause(3000);
-    if (!isSubmissionConfirmed(await elementExists(driver, fieldSelectors))) {
-      throw new Error('Submission was not confirmed; do not rerun until checking Facebook manually');
-    }
+    const postedCommentSelectors = selectorCandidates('nickname', config.locale, input.comment);
+    const confirmed = await waitFor(driver, async () => isSubmissionConfirmed({
+      commentFieldExists: await elementExists(driver, fieldSelectors),
+      postedCommentVisible: await elementExists(driver, postedCommentSelectors),
+    }), config.timeoutMs);
+    if (!confirmed) throw new Error('Submission was not confirmed; do not rerun until checking Facebook manually');
     const artifacts = await saveArtifacts(driver, config.artifactDir, 'final', false);
     if (!artifacts.length) throw new Error('Submission completed but final screenshot could not be saved');
     console.log(`Submitted once and composer closed. Screenshot: ${artifacts[0]}`);

@@ -9,6 +9,7 @@ const {
   detectBlockingScreen,
   isExpectedPackage,
   isSubmissionConfirmed,
+  isIdentitySelectionConfirmed,
   parseCliArgs,
 } = require('../scripts/fb-android-comment-lib');
 
@@ -61,14 +62,14 @@ test('validates nickname and comment boundaries', () => {
 
 test('uses exact injection-safe selectors for nickname and post button', () => {
   const selectors = selectorCandidates('nickname', 'vi', `A\\\"'); textContains('Victim`);
-  assert.ok(selectors.every((value) => value.startsWith('xpath=')));
+  assert.ok(selectors.every((value) => value.startsWith('//')));
   assert.ok(selectors.every((value) => !value.includes('new UiSelector')));
   assert.ok(selectorCandidates('postButton', 'vi').every((value) => !value.includes('textContains')));
 });
 
 test('uses valid XPath selectors with locale fallback for non-destructive controls', () => {
   const selectors = selectorCandidates('commentButton', 'vi');
-  assert.ok(selectors.every((value) => value.startsWith('xpath=')));
+  assert.ok(selectors.every((value) => value.startsWith('//')));
   assert.ok(selectors.some((value) => value.includes('Comment')));
 });
 
@@ -84,7 +85,19 @@ test('requires Facebook package after deep link', () => {
   assert.equal(isExpectedPackage('com.android.chrome', 'com.facebook.katana'), false);
 });
 
-test('confirms submission only after composer disappears', () => {
-  assert.equal(isSubmissionConfirmed(true), false);
-  assert.equal(isSubmissionConfirmed(false), true);
+test('builds exact selected-state selector for nickname confirmation', () => {
+  const [selector] = selectorCandidates('selectedNickname', 'vi', 'Alias');
+  assert.match(selector, /@checked='true' or @selected='true'/);
+  assert.match(selector, /@text='Alias' or @content-desc='Alias'/);
+});
+
+test('confirms identity selection only from selected nickname state', () => {
+  assert.equal(isIdentitySelectionConfirmed(true), true);
+  assert.equal(isIdentitySelectionConfirmed(false), false);
+});
+
+test('confirms submission only after composer closes and exact comment appears', () => {
+  assert.equal(isSubmissionConfirmed({ commentFieldExists: false, postedCommentVisible: true }), true);
+  assert.equal(isSubmissionConfirmed({ commentFieldExists: true, postedCommentVisible: true }), false);
+  assert.equal(isSubmissionConfirmed({ commentFieldExists: false, postedCommentVisible: false }), false);
 });
