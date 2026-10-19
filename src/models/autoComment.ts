@@ -2,6 +2,10 @@
  * Types cho Auto Comment Facebook Groups
  */
 
+export interface AutoCommentAttachment {
+  file_path: string;
+}
+
 export interface AutoCommentConfig {
   id: string;
   workspace_id: string;
@@ -22,6 +26,8 @@ export interface AutoCommentConfig {
   comment_count_per_post?: number;
   /** 'sequential' (thứ tự 1→2→… quay vòng) hoặc 'random' (không trùng trong cùng bài). */
   comment_pick_mode?: 'random' | 'sequential';
+  /** Ảnh tùy chọn, cùng index với comments. */
+  comment_attachments?: Array<AutoCommentAttachment | null>;
 }
 
 export interface AutoCommentLog {

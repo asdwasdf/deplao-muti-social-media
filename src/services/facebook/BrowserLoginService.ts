@@ -9,7 +9,6 @@ import { v4 as uuid } from 'uuid';
 import { resolvePlaywrightBrowserPath } from './FacebookUtils';
 import Logger from '../../utils/Logger';
 import DatabaseService from '../database/DatabaseService';
-import { createProxyAgent } from '../../utils/ProxyHelper';
 
 // Lazy require Playwright để không crash app khi chưa cài browser
 type PlaywrightModule = typeof import('playwright');
@@ -234,23 +233,13 @@ class BrowserLoginService {
       }
       const cookieString = Object.entries(cookieMap).map(([n, v]) => `${n}=${v}`).join('; ');
 
-      // Validate qua initSession (giống _addFBAccountCommon làm)
-      const { initSession } = await import('./FacebookSession');
-      let httpsAgent: any = undefined;
-      if (attempt.proxyId) {
-        try {
-          const proxy = DatabaseService.getInstance().getProxyById(attempt.proxyId);
-          if (proxy) httpsAgent = createProxyAgent(proxy);
-        } catch {}
-      }
-      const sessionData = await initSession(cookieString, httpsAgent);
-      const fbId = sessionData.FacebookID;
-      if (!fbId || fbId === '0' || fbId.includes('Unable') || !/^\d+$/.test(fbId)) {
-        throw new Error('Cookie không hợp lệ hoặc đã hết hạn sau khi xác thực.');
-      }
-
       attempt.done = true;
-      attempt.onEvent({ kind: 'success', facebookId: fbId, name: fbId, cookie: cookieString });
+      attempt.onEvent({
+        kind: 'success',
+        facebookId: cookieMap.c_user,
+        name: cookieMap.c_user,
+        cookie: cookieString,
+      });
     } catch (err: any) {
       Logger.warn(`[BrowserLoginService] Attempt error: ${err.message}`);
       if (!attempt.done) {
@@ -283,6 +272,11 @@ class BrowserLoginService {
             attempt.onEvent({ kind: 'twofaRequired' });
           }
           if (hasUser && hasXs) {
+            if (attempt.pollTimer) {
+              clearInterval(attempt.pollTimer);
+              attempt.pollTimer = null;
+            }
+            clearInterval(checkDone);
             resolve(true);
             return;
           }

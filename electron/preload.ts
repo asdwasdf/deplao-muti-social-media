@@ -547,6 +547,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // ─── Auto Comment ─────────────────────────────────────────────────────
   autoComment: {
+    selectTemplateImage:() => ipcRenderer.invoke('fb:autoComment:selectTemplateImage'),
+    getTemplateImagePreview:(params: { filePath: string }) => ipcRenderer.invoke('fb:autoComment:getTemplateImagePreview', params),
     getConfigs:() => ipcRenderer.invoke('fb:autoComment:getConfigs'),
     getConfig:(params: { id: string }) => ipcRenderer.invoke('fb:autoComment:getConfig', params),
     saveConfig:(params: any) => ipcRenderer.invoke('fb:autoComment:saveConfig', params),
@@ -564,9 +566,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getJobLogs:(params: { jobId: string; limit?: number }) => ipcRenderer.invoke('fb:autoComment:getJobLogs', params),
     getWorkerStatus:() => ipcRenderer.invoke('fb:autoComment:getWorkerStatus'),
     checkAccountSession:(params: { accountId: string }) => ipcRenderer.invoke('fb:autoComment:checkAccountSession', params),
+    fetchGroupPosts:(params: { accountId: string; groupId: string; limit: number; feedType?: 'relevant' | 'recent_activity' | 'new_posts' }) => ipcRenderer.invoke('fb:autoComment:fetchGroupPosts', params),
     // Browser debug
     debugDumpCookie:(params: { accountId: string }) => ipcRenderer.invoke('fb:debugDumpCookie', params),
     debugOpenBrowserWithCookie:(params: { accountId: string; startUrl?: string }) => ipcRenderer.invoke('fb:debugOpenBrowserWithCookie', params),
+    debugOpenTabWithCookie:(params: { accountId: string; url: string }) => ipcRenderer.invoke('fb:debugOpenTabWithCookie', params),
     debugCloseBrowser:(params?: { accountId?: string }) => ipcRenderer.invoke('fb:debugCloseBrowser', params || {}),
     debugListOpenBrowsers:() => ipcRenderer.invoke('fb:debug:listOpenBrowsers'),
   },

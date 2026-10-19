@@ -44,8 +44,7 @@ export default function FacebookBrowserLoginTab({ onSuccess, proxyId, onProxyCha
       setStatusKind(event.kind);
       if (event.kind === 'error') setErrorMsg(event.message);
       if (event.kind === 'success') {
-        showNotification(`Đăng nhập thành công: ${event.name || event.facebookId}`, 'success');
-        // Gọi addAccount để lưu cookie vào DB
+        // Gọi addAccount để xác thực và lưu cookie vào DB
         (async () => {
           try {
             const addRes = await window.electronAPI.fb.addAccount({
@@ -54,14 +53,18 @@ export default function FacebookBrowserLoginTab({ onSuccess, proxyId, onProxyCha
             });
             if (!addRes?.success) {
               showNotification(`Lưu tài khoản thất bại: ${addRes?.error}`, 'error');
+              setBusy(false);
+              return;
             }
+            showNotification(`Đăng nhập thành công: ${addRes.name || addRes.facebookId}`, 'success');
             // Lấy danh sách account rồi đóng modal
             const res = await window.electronAPI.fb.getAccounts();
             if (res?.success && res.accounts) setAccounts(res.accounts);
+            onSuccess();
           } catch (err: any) {
             showNotification(`Lỗi: ${err?.message || 'Không rõ'}`, 'error');
+            setBusy(false);
           }
-          onSuccess();
         })();
       }
       if (event.kind === 'cancelled' || event.kind === 'error') {

@@ -13,7 +13,6 @@
 
 import DatabaseService from '../database/DatabaseService';
 import FacebookService from './FacebookService';
-import { FacebookScanService } from './FacebookScanService';
 import { BrowserDebugService } from './BrowserDebugService';
 import { secureGet } from '../secure/SecureSettingsService';
 import Logger from '../../utils/Logger';
@@ -28,6 +27,10 @@ import {
 import axios from 'axios';
 import { buildFormData, buildGraphQLRequest, buildPostConfig, parseFBResponse, jsonMinimal, getNextReqId } from './FacebookUtils';
 import { assertFacebookMutationSuccess } from './FacebookGraphQLResult';
+import { uploadAttachment } from './FacebookAttachment';
+import { isManagedAutoCommentImagePath, validateAutoCommentImageFile } from './AutoCommentImage';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const GRAPHQL_URL = 'https://www.facebook.com/webgraphql/mutation/';
 
@@ -38,22 +41,76 @@ const GRAPHQL_URL = 'https://www.facebook.com/webgraphql/mutation/';
 // comment thử 1 chữ "ok" bằng tay → click request → copy doc_id từ Payload.
 // Update dòng bên dưới rồi build lại.
 const DOC_ID_CREATE_COMMENT = '29732233479699606';
-// Doc ID 9815271091886179 đã bị Facebook rotate → dùng Pagination query mới
-// (load feed khi scroll). Có thể cần initial query riêng để lấy cursor.
-const DOC_ID_GROUP_FEED_PAGINATION = '28295952946774461';
-const FRIENDLY_GROUP_FEED_PAGINATION = 'GroupsCometFeedRegularStoriesPaginationQuery';
 const DOC_ID_GROUP_ROOT = '4901247942874490';
 const FRIENDLY_CREATE_COMMENT = 'useCometUFICreateCommentMutation';
 const FRIENDLY_GROUP_ROOT = 'GroupsCometQuery';
 
+export function buildCommentAttachments(
+  attachmentId?: string | number,
+): null | Array<{ photo: { id: string } }> {
+  const id = String(attachmentId ?? '').trim();
+  return id ? [{ photo: { id } }] : null;
+}
+
 function fbCookieKey(accountId: string): string {
   return `fb_cookie_${accountId}`;
+}
+
+export function recoverInterruptedAutoCommentJobs(
+  database: { run(sql: string, params?: any[]): void },
+  endedAt = Date.now(),
+): void {
+  database.run(
+    `UPDATE fb_auto_comment_jobs
+       SET status = 'failed', ended_at = ?, error = ?
+       WHERE status IN ('pending', 'running')`,
+    [endedAt, 'App bị dừng khi job đang chạy; cần chạy lại.'],
+  );
+}
+
+export function normalizeCommentAttachments(
+  raw: unknown,
+  commentCount: number,
+): Array<{ file_path: string } | null> {
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch { parsed = []; }
+  }
+  const items = Array.isArray(parsed) ? parsed : [];
+  return Array.from({ length: Math.max(0, commentCount) }, (_, index) => {
+    const item = items[index];
+    const filePath = item && typeof item === 'object' && typeof item.file_path === 'string' ? item.file_path.trim() : '';
+    return filePath ? { file_path: filePath } : null;
+  });
+}
+
+export function listAttachmentPaths(raw: unknown): string[] {
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch { parsed = []; }
+  }
+  const items = Array.isArray(parsed) ? parsed : [];
+  return normalizeCommentAttachments(items, items.length)
+    .filter((item): item is { file_path: string } => Boolean(item))
+    .map((item) => item.file_path);
+}
+
+/** Ảnh mẫu nằm trong media của workspace hiện tại; DB lưu path tương đối. */
+function getAutoCommentImageDir(): string {
+  const FileStorageService = require('../file/FileStorageService').default;
+  return path.join(FileStorageService.getBaseDir(), 'auto-comment-images');
+}
+
+function resolveAutoCommentImagePath(filePath: string): string {
+  const FileStorageService = require('../file/FileStorageService').default;
+  return FileStorageService.resolveAbsolutePath(filePath);
 }
 
 /**
  * Chuẩn hóa group ID: chấp nhận URL đầy đủ, relative path, hoặc ID số thuần.
  * GraphQL cần numeric group ID, không phải URL.
  */
+
 function normalizeGroupId(raw: string): string {
   if (!raw) return '';
   const trimmed = String(raw).trim();
@@ -96,6 +153,7 @@ export class FacebookAutoCommentService {
 
   start(): void {
     if (this.workerEnabled) return;
+    recoverInterruptedAutoCommentJobs(DatabaseService.getInstance());
     this.workerEnabled = true;
     this.lastTickError = '';
     Logger.log('[FacebookAutoCommentService] Worker started');
@@ -455,11 +513,13 @@ export class FacebookAutoCommentService {
 
   /** Map raw DB row → AutoCommentConfig. Giữ nguyên \n bên trong từng comment template. */
   private rowToConfig(row: any): AutoCommentConfig {
+    const comments = JSON.parse(row.comments || '[]');
     return {
       id: row.id,
       workspace_id: row.workspace_id || '',
       account_id: row.account_id,
-      comments: JSON.parse(row.comments || '[]'),
+      comments,
+      comment_attachments: normalizeCommentAttachments(row.comment_attachments, comments.length),
       group_ids: JSON.parse(row.group_ids || '[]').map(normalizeGroupId).filter((id: string) => id),
       max_posts_per_run: row.max_posts_per_run || 10,
       schedule_minutes: row.schedule_minutes || 60,
@@ -470,6 +530,35 @@ export class FacebookAutoCommentService {
       comment_count_per_post: row.comment_count_per_post == null ? undefined : Number(row.comment_count_per_post),
       comment_pick_mode: row.comment_pick_mode === 'random' ? 'random' : 'sequential',
     };
+  }
+
+  async fetchGroupPostsForVerification(
+    accountId: string,
+    rawGroupId: string,
+    requestedLimit: number,
+    feedType: FacebookGroupFeedType = 'new_posts',
+  ): Promise<GroupPostVerification> {
+    const groupId = normalizeGroupId(rawGroupId);
+    if (!groupId) throw new Error('Group ID không hợp lệ');
+
+    const limit = Math.min(100, Math.max(1, Math.floor(Number(requestedLimit) || 0)));
+    const cookie = secureGet(fbCookieKey(accountId));
+    if (!cookie) throw new Error('Tài khoản chưa có cookie Facebook');
+
+    const service = await FacebookService.getInstance(accountId);
+    if (!service?.isConnected()) throw new Error('Phiên Facebook đã hết hạn hoặc chưa kết nối');
+
+    const feedUrl = buildFacebookGroupFeedUrl(groupId, feedType);
+    const posts = await this.getGroupPosts(service, groupId, limit, feedUrl);
+    const groupName = posts.length > 0 ? await this.getGroupName(service, groupId) : '';
+    return buildGroupPostVerification({
+      accountId,
+      groupId,
+      fetchedAt: Date.now(),
+      feedType,
+      feedUrl,
+      posts: posts.map((post) => ({ ...post, groupName })),
+    });
   }
 
   /** Chạy 1 config — giữ nguyên logic, thêm jobId/cancelToken. */
@@ -498,8 +587,11 @@ export class FacebookAutoCommentService {
 
     // Mỗi phần tử của config.comments = 1 mẫu trọn vẹn (có thể chứa \n).
     // Không split theo \n ở đây — chỉ filter mẫu rỗng (data cũ từ schema split-by-line).
-    const comments = config.comments.filter((c) => c.trim().length > 0);
-    if (comments.length === 0) {
+    const templates = config.comments
+      .map((text, index) => ({ text, attachment: config.comment_attachments?.[index] || null }))
+      .filter(({ text }) => text.trim().length > 0);
+    const comments = templates.map(({ text }) => text);
+    if (templates.length === 0) {
       result.success = false;
       result.errors.push('Chưa có nội dung comment');
       return result;
@@ -598,16 +690,27 @@ export class FacebookAutoCommentService {
       }
 
       for (let i = 0; i < picks.length; i++) {
-        const commentText = comments[picks[i]];
+        const template = templates[picks[i]];
+        const commentText = template.text;
 
         try {
-          const commentResult = await this.commentOnPost(service, post.postId, commentText, post.groupId, resolvedDocId);
+          const commentResult = await this.commentOnPost(
+            service,
+            post.postId,
+            commentText,
+            post.groupId,
+            resolvedDocId,
+            template.attachment?.file_path,
+          );
 
           if (commentResult.success) {
             postedComments.push(commentText);
             result.commentsPosted++;
           } else {
-            Logger.warn(`[FacebookAutoCommentService] Comment ${i + 1} failed: ${commentResult.error}`);
+            hasError = true;
+            const error = commentResult.error || 'Comment failed';
+            Logger.warn(`[FacebookAutoCommentService] Comment ${i + 1} failed: ${error}`);
+            result.errors.push(`Post ${post.postId}, mẫu ${picks[i] + 1}: ${error}`);
           }
 
           // Delay giữa các comments (tránh spam)
@@ -671,36 +774,22 @@ export class FacebookAutoCommentService {
     return result;
   }
 
-  /** Lấy bài viết mới nhất từ GraphQL; HTML chỉ là fallback cho markup cũ. */
-  private async getGroupPosts(service: FacebookService, groupId: string, limit: number): Promise<GroupPost[]> {
+  /** Lấy bài viết mới nhất từ HTML và response feed của browser đã đăng nhập. */
+  private async getGroupPosts(
+    service: FacebookService,
+    groupId: string,
+    limit: number,
+    feedUrl = buildFacebookGroupFeedUrl(groupId, 'new_posts'),
+  ): Promise<GroupPost[]> {
     try {
       const accountId = service['accountId'];
-      const scan = await FacebookScanService.getInstance().scanPostTimeline(accountId, groupId, 'group');
-      if (scan.success) {
-        const posts = normalizeScannedGroupPosts(scan.items, groupId, limit);
-        const response = scan._lastResponse || '';
-        Logger.log(
-          `[AutoComment] GraphQL group=${groupId} docId=${scan._lastDocId || 'none'} ` +
-          `items=${scan.items.length} posts=${posts.length} ` +
-          `signals={errors:${response.includes('"errors"')},node:${response.includes('"node"')},` +
-          `groupFeed:${response.includes('"group_feed"')},edges:${response.includes('"edges"')},` +
-          `postId:${response.includes('"post_id"')},story:${response.includes('"story"')}}`
-        );
-        if (posts.length >= limit) return posts;
-      } else {
-        Logger.warn(`[AutoComment] GraphQL group=${groupId} failed: ${scan.error || 'unknown error'}`);
-      }
-
       const cookie = secureGet(fbCookieKey(accountId));
       if (!cookie) {
         Logger.error(`[AutoComment] No cookie for account ${service['accountId']}`);
         return [];
       }
 
-      // `sorting_setting=CHRONOLOGICAL` requests newest-first discussion feed.
-      // Publication timestamps are still parsed and sorted locally across groups.
-      const url = `https://www.facebook.com/groups/${groupId}/?sorting_setting=CHRONOLOGICAL`;
-      const response = await axios.get(url, {
+      const response = await axios.get(feedUrl, {
         headers: {
           'Cookie': cookie,
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -729,7 +818,7 @@ export class FacebookAutoCommentService {
 
       if (posts.length >= limit) return selectNewestGroupPosts(posts, limit);
 
-      const rendered = await BrowserDebugService.getInstance().renderWithCookie(accountId, url, {
+      const rendered = await BrowserDebugService.getInstance().renderWithCookie(accountId, feedUrl, {
         maxScrolls: Math.min(30, Math.max(6, limit)),
         scrollDelayMs: 1500,
         stableScrolls: 4,
@@ -823,9 +912,9 @@ export class FacebookAutoCommentService {
   }
 
   /** Comment lên bài viết */
-  private async commentOnPost(service: FacebookService, postId: string, text: string, groupId?: string, docId?: string): Promise<{ success: boolean; error?: string }> {
+  private async commentOnPost(service: FacebookService, postId: string, text: string, groupId?: string, docId?: string, imagePath?: string): Promise<{ success: boolean; error?: string }> {
     try {
-      return await this.commentViaGraphQL(service, postId, text, groupId, docId);
+      return await this.commentViaGraphQL(service, postId, text, groupId, docId, imagePath);
     } catch (err: any) {
       Logger.error(`[AutoComment.commentOnPost] post=${postId} threw: ${err.message}`);
       return { success: false, error: err.message };
@@ -851,7 +940,7 @@ export class FacebookAutoCommentService {
   }
 
   /** Comment qua GraphQL mutation */
-  private async commentViaGraphQL(service: FacebookService, postId: string, text: string, groupId?: string, docId?: string): Promise<{ success: boolean; error?: string }> {
+  private async commentViaGraphQL(service: FacebookService, postId: string, text: string, groupId?: string, docId?: string, imagePath?: string): Promise<{ success: boolean; error?: string }> {
     try {
       const cookie = secureGet(fbCookieKey(service['accountId']));
       if (!cookie) return { success: false, error: 'No cookie' };
@@ -859,6 +948,17 @@ export class FacebookAutoCommentService {
       const dataFB = service['dataFB'];
       if (!dataFB) return { success: false, error: 'Session not initialized' };
       if (!dataFB.lsd) return { success: false, error: 'LSD missing — re-login required' };
+
+      let attachments: ReturnType<typeof buildCommentAttachments> = null;
+      if (imagePath) {
+        const absolutePath = resolveAutoCommentImagePath(imagePath);
+        if (!fs.existsSync(absolutePath)) return { success: false, error: 'Không tìm thấy ảnh đính kèm' };
+        const imageError = await validateAutoCommentImageFile(absolutePath, getAutoCommentImageDir());
+        if (imageError) return { success: false, error: imageError };
+        const uploaded = await uploadAttachment(dataFB, absolutePath, service['httpsAgent']);
+        attachments = buildCommentAttachments(uploaded?.attachmentId);
+        if (!attachments) return { success: false, error: 'Upload ảnh thất bại' };
+      }
 
       // FB expects feedback_id as base64("feedback:<postId>"), not the raw numeric id.
       // Capture from working browser request: "ZmVlZGJhY2s6MTQ2MTMxNTQxMjYyOTgxMQ==" → "feedback:1461315412629811".
@@ -888,7 +988,7 @@ export class FacebookAutoCommentService {
           client_mutation_id: Math.random().toString(36).substring(2),
           feedback_id: feedbackIdB64,
           message: { ranges: [], text },
-          attachments: null,
+          attachments,
           formatting_style: null,
           is_inline_vote_enabled_for_qna: false,
           vod_video_timestamp: null,
@@ -1031,15 +1131,22 @@ export class FacebookAutoCommentService {
         ? null
         : Math.max(1, Math.floor(config.comment_count_per_post));
     const pickModeForDb = config.comment_pick_mode === 'random' ? 'random' : 'sequential';
+    const comments = config.comments || [];
+    const attachments = normalizeCommentAttachments(config.comment_attachments, comments.length);
+    const imageDir = getAutoCommentImageDir();
+    if (attachments.some((item) => item && !isManagedAutoCommentImagePath(resolveAutoCommentImagePath(item.file_path), imageDir))) {
+      throw new Error('Ảnh đính kèm không hợp lệ');
+    }
+    const previousPaths = config.id ? this.getConfigImagePaths(config.id) : [];
 
     DatabaseService.getInstance().run(
       `INSERT OR REPLACE INTO fb_auto_comment_configs
        (id, workspace_id, account_id, comments, group_ids,
         max_posts_per_run, schedule_minutes, enabled, created_at, updated_at, doc_id_create_comment,
-        comment_count_per_post, comment_pick_mode)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        comment_count_per_post, comment_pick_mode, comment_attachments)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, config.workspace_id || '', config.account_id || '',
-       JSON.stringify(config.comments || []),
+       JSON.stringify(comments),
        JSON.stringify(normalizedGroups),
        config.max_posts_per_run || 10,
        config.schedule_minutes || 60,
@@ -1048,8 +1155,10 @@ export class FacebookAutoCommentService {
        now,
        config.doc_id_create_comment || null,
        perPostForDb,
-       pickModeForDb]
+       pickModeForDb,
+       JSON.stringify(attachments)]
     );
+    this.removeUnreferencedImages(previousPaths);
 
     // Refresh scheduler so new schedule_minutes takes effect.
     this.stop();
@@ -1060,9 +1169,35 @@ export class FacebookAutoCommentService {
 
   /** Xóa config */
   deleteConfig(id: string): void {
+    const previousPaths = this.getConfigImagePaths(id);
     DatabaseService.getInstance().run(`DELETE FROM fb_auto_comment_configs WHERE id = ?`, [id]);
     DatabaseService.getInstance().run(`DELETE FROM fb_auto_comment_logs WHERE config_id = ?`, [id]);
     // Jobs rows left in place for audit; FK CASCADE handles configs.
+    this.removeUnreferencedImages(previousPaths);
+  }
+
+  private getConfigImagePaths(id: string): string[] {
+    const row = DatabaseService.getInstance().queryOne<any>(
+      `SELECT comment_attachments FROM fb_auto_comment_configs WHERE id = ?`,
+      [id]
+    );
+    return listAttachmentPaths(row?.comment_attachments);
+  }
+
+  /** Chỉ xóa sau khi DB đã commit; ảnh còn được config khác tham chiếu thì giữ. Lỗi xóa = file mồ côi vô hại. */
+  private removeUnreferencedImages(candidates: string[]): void {
+    if (candidates.length === 0) return;
+    const rows = DatabaseService.getInstance().query<any>(
+      `SELECT comment_attachments FROM fb_auto_comment_configs`
+    ) || [];
+    const referenced = new Set(rows.flatMap((row) => listAttachmentPaths(row.comment_attachments)));
+    const imageDir = getAutoCommentImageDir();
+    for (const filePath of candidates) {
+      if (referenced.has(filePath)) continue;
+      const absolutePath = resolveAutoCommentImagePath(filePath);
+      if (!isManagedAutoCommentImagePath(absolutePath, imageDir)) continue;
+      fs.promises.unlink(absolutePath).catch(() => undefined);
+    }
   }
 
   /** Lấy logs theo config (giữ API cũ). jobId = null → trả legacy bucket. */
@@ -1168,11 +1303,52 @@ export function hasReachedAutoCommentTarget(successfulPosts: number, target: num
   return successfulPosts >= Math.max(0, target);
 }
 
-interface GroupPost {
+export interface GroupPost {
   postId: string;
   groupId: string;
   groupName: string;
   timestamp: number;
+}
+
+export type FacebookGroupFeedType = 'relevant' | 'recent_activity' | 'new_posts';
+
+export function buildFacebookGroupFeedUrl(groupId: string, feedType: FacebookGroupFeedType): string {
+  const root = `https://www.facebook.com/groups/${encodeURIComponent(groupId)}/`;
+  if (feedType === 'recent_activity') return `${root}?sorting_setting=RECENT_ACTIVITY`;
+  if (feedType === 'new_posts') return `${root}?sorting_setting=CHRONOLOGICAL`;
+  return root;
+}
+
+export interface GroupPostVerification {
+  accountId: string;
+  groupId: string;
+  fetchedAt: number;
+  feedType: FacebookGroupFeedType;
+  feedUrl: string;
+  postCount: number;
+  posts: Array<GroupPost & { url: string }>;
+}
+
+export function buildGroupPostVerification(input: {
+  accountId: string;
+  groupId: string;
+  fetchedAt: number;
+  feedType: FacebookGroupFeedType;
+  feedUrl: string;
+  posts: GroupPost[];
+}): GroupPostVerification {
+  return {
+    accountId: input.accountId,
+    groupId: input.groupId,
+    fetchedAt: input.fetchedAt,
+    feedType: input.feedType,
+    feedUrl: input.feedUrl,
+    postCount: input.posts.length,
+    posts: input.posts.map((post) => ({
+      ...post,
+      url: `https://www.facebook.com/groups/${encodeURIComponent(post.groupId)}/permalink/${encodeURIComponent(post.postId)}/`,
+    })),
+  };
 }
 
 export function normalizeScannedGroupPosts(items: any[], groupId: string, limit: number): GroupPost[] {

@@ -33,6 +33,23 @@ export function isFacebookContentUnavailable(text: string): boolean {
   return /Bạn hiện không xem được nội dung này|This content isn't available/i.test(text);
 }
 
+export function mergeUniqueHtmlSnapshots(snapshots: string[]): string {
+  return Array.from(new Set(snapshots.filter(Boolean))).join('\n');
+}
+
+export function isFacebookGroupFeedGraphQLRequest(url: string, body: string): boolean {
+  if (!url.includes('/api/graphql/')) return false;
+  const name = new URLSearchParams(body).get('fb_api_req_friendly_name') || '';
+  return name.startsWith('GroupsCometFeed');
+}
+
+export async function openFacebookTab(context: any, url: string): Promise<OpenBrowserResult> {
+  const page = await context.newPage();
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.bringToFront();
+  return { success: true, url: page.url() };
+}
+
 export interface OpenBrowserOptions {
   accountId: string;
   startUrl?: string;
@@ -80,6 +97,27 @@ export class BrowserDebugService {
       BrowserDebugService.instance = new BrowserDebugService();
     }
     return BrowserDebugService.instance;
+  }
+
+  async openTabWithCookie(accountId: string, url: string): Promise<OpenBrowserResult> {
+    if (!accountId) return { success: false, error: 'accountId is required' };
+    if (!/^https:\/\/(?:www\.)?facebook\.com\//i.test(url)) {
+      return { success: false, error: 'Chỉ cho phép mở URL Facebook HTTPS' };
+    }
+
+    let record = this.byAccount.get(accountId);
+    if (!record || !record.page || record.page.isClosed()) {
+      const opened = await this.openWithCookie({ accountId, startUrl: 'https://www.facebook.com/', keepOpen: true, headless: false });
+      if (!opened.success) return opened;
+      record = this.byAccount.get(accountId);
+    }
+    if (!record) return { success: false, error: 'Không khởi tạo được browser Facebook' };
+
+    try {
+      return await openFacebookTab(record.context, url);
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
   }
 
   async openWithCookie(opts: OpenBrowserOptions): Promise<OpenBrowserResult> {
@@ -227,6 +265,7 @@ export class BrowserDebugService {
       await context.addCookies(cookies);
       const page = await context.newPage();
       const graphqlQueries = new Map<string, string>();
+      const graphqlResponses: string[] = [];
       page.on('request', (request: any) => {
         if (!request.url().includes('/api/graphql/')) return;
         const body = request.postData() || '';
@@ -234,6 +273,13 @@ export class BrowserDebugService {
         const name = params.get('fb_api_req_friendly_name') || '';
         const docId = params.get('doc_id') || '';
         if (name && docId) graphqlQueries.set(name, docId);
+      });
+      page.on('response', async (response: any) => {
+        const request = response.request();
+        const body = request.postData() || '';
+        if (!isFacebookGroupFeedGraphQLRequest(response.url(), body)) return;
+        const text = await response.text().catch(() => '');
+        if (text) graphqlResponses.push(text);
       });
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
       let feedReady = true;
@@ -245,18 +291,20 @@ export class BrowserDebugService {
 
       const maxScrolls = Math.max(0, options.maxScrolls || 0);
       const stableLimit = Math.max(1, options.stableScrolls || 3);
+      const snapshots = [await page.content()];
       let stable = 0;
       let previousHeight = 0;
       for (let i = 0; i < maxScrolls && stable < stableLimit; i++) {
         const height = await page.evaluate('document.documentElement.scrollHeight');
         await page.evaluate('window.scrollTo(0, document.documentElement.scrollHeight)');
         await page.waitForTimeout(Math.max(250, options.scrollDelayMs || 1500));
+        snapshots.push(await page.content());
         const nextHeight = await page.evaluate('document.documentElement.scrollHeight');
         stable = nextHeight <= height && nextHeight <= previousHeight ? stable + 1 : 0;
         previousHeight = nextHeight;
       }
 
-      const html = await page.content();
+      const html = mergeUniqueHtmlSnapshots([...snapshots, ...graphqlResponses]);
       const bodyText = await page.locator('body').innerText().catch(() => '');
       if (isFacebookContentUnavailable(bodyText)) {
         return {

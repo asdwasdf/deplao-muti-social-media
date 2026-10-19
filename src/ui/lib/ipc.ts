@@ -612,6 +612,8 @@ declare global {
       };
       // ─── Auto Comment ─────────────────────────────────────────────────
       autoComment: {
+        selectTemplateImage:() => Promise<{ success: boolean; canceled?: boolean; attachment?: { file_path: string; preview_url: string }; error?: string }>;
+        getTemplateImagePreview:(params: { filePath: string }) => Promise<{ success: boolean; preview_url?: string; error?: string }>;
         getConfigs:() => Promise<{ success: boolean; configs: any[]; error?: string }>;
         getConfig:(params: { id: string }) => Promise<{ success: boolean; config: any | null; error?: string }>;
         saveConfig:(params: any) => Promise<{ success: boolean; id?: string; error?: string }>;
@@ -633,9 +635,22 @@ declare global {
           error?: string;
         }>;
         checkAccountSession:(params: { accountId: string }) => Promise<{ success: boolean; state: 'verified' | 'cookie_missing' | 'expired' | 'unknown'; reason?: string; error?: string }>;
+        fetchGroupPosts:(params: { accountId: string; groupId: string; limit: number; feedType?: 'relevant' | 'recent_activity' | 'new_posts' }) => Promise<{
+          success: boolean;
+          accountId?: string;
+          groupId?: string;
+          fetchedAt?: number;
+          feedType?: 'relevant' | 'recent_activity' | 'new_posts';
+          feedUrl?: string;
+          postCount?: number;
+          posts?: Array<{ postId: string; groupId: string; groupName: string; timestamp: number; url: string }>;
+          filePath?: string;
+          error?: string;
+        }>;
         // Browser debug
         debugDumpCookie:(params: { accountId: string }) => Promise<{ success: boolean; path?: string; error?: string }>;
         debugOpenBrowserWithCookie:(params: { accountId: string; startUrl?: string }) => Promise<{ success: boolean; url?: string; alreadyOpen?: boolean; error?: string }>;
+        debugOpenTabWithCookie:(params: { accountId: string; url: string }) => Promise<{ success: boolean; url?: string; error?: string }>;
         debugCloseBrowser:(params?: { accountId?: string }) => Promise<{ success: boolean; error?: string }>;
         debugListOpenBrowsers:() => Promise<{ success: boolean; accountIds: string[]; error?: string }>;
       };

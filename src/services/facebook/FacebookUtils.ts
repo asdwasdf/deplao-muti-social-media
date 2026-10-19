@@ -407,21 +407,24 @@ export function resolvePlaywrightBrowserPath(): string {
     path.resolve(process.cwd(), 'playwright-browsers', 'chrome-win', exeName),
     path.resolve(process.cwd(), 'playwright-browsers', 'chromium', exeName),
   ];
-  if (process.env.LOCALAPPDATA) {
-    try {
-      const cacheRoot = path.join(process.env.LOCALAPPDATA, 'ms-playwright');
-      if (fs.existsSync(cacheRoot)) {
-        const entries = fs.readdirSync(cacheRoot, { withFileTypes: true });
-        for (const entry of entries) {
-          if (entry.isDirectory() && entry.name.startsWith('chromium')) {
-            devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-win64', exeName));
-            devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-win', exeName));
-            devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-linux', exeName));
-          }
+  const cacheRoot = process.env.LOCALAPPDATA
+    ? path.join(process.env.LOCALAPPDATA, 'ms-playwright')
+    : path.join(require('os').homedir(), process.platform === 'darwin' ? 'Library/Caches/ms-playwright' : '.cache/ms-playwright');
+  try {
+    if (fs.existsSync(cacheRoot)) {
+      const entries = fs.readdirSync(cacheRoot, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory() && entry.name.startsWith('chromium-')) {
+          devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-win64', exeName));
+          devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-win', exeName));
+          devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-linux', exeName));
+          devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-linux64', exeName));
+          devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-mac-x64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'));
+          devCandidates.push(path.join(cacheRoot, entry.name, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'));
         }
       }
-    } catch { /* ignore */ }
-  }
+    }
+  } catch { /* ignore */ }
   for (const c of devCandidates) {
     if (fs.existsSync(c)) return c;
   }
@@ -472,9 +475,11 @@ export function resolveE2EEBinaryPath(): string {
   // __dirname is in src/services/facebook (raw TS) or dist-electron/src/services/facebook (compiled)
   // Bridge is now at src/bridge-e2ee/build/
   const candidates = [
-    // raw TS: src/services/facebook → ../../src/bridge-e2ee/build/
+    // Electron dev starts from project root, independent of compiled __dirname layout.
+    path.resolve(process.cwd(), 'src', 'bridge-e2ee', 'build', binaryName),
+    // raw TS: src/services/facebook → src/bridge-e2ee/build/
     path.join(__dirname, '..', '..', 'bridge-e2ee', 'build', binaryName),
-    // compiled: dist-electron/src/services/facebook → ../../../src/bridge-e2ee/build/
+    // compiled: dist-electron/src/services/facebook → src/bridge-e2ee/build/
     path.join(__dirname, '..', '..', '..', '..', 'src', 'bridge-e2ee', 'build', binaryName),
     // fallback: old locations (pre-move)
     path.join(__dirname, '..', '..', '..', 'bridge-e2ee', 'build', binaryName),
@@ -488,8 +493,8 @@ export function resolveE2EEBinaryPath(): string {
 
   throw new Error(
     `Không tìm thấy E2EE bridge binary (${binaryName}). ` +
-    `Đặt biến môi trường FBCHAT_E2EE_BIN hoặc build bridge từ bridge-e2ee/. ` +
-    `Xem docs: bridge-e2ee/README.md`,
+    `Chạy 'npm run build:bridge-e2ee' hoặc đặt biến môi trường FBCHAT_E2EE_BIN. ` +
+    `Xem docs: src/bridge-e2ee/README.md`,
   );
 }
 

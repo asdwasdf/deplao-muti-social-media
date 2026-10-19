@@ -111,18 +111,33 @@ function main() {
     process.exit(1);
   }
   const metaManifest = manifest.submodules?.['bridge-e2ee/meta'];
-  if (!metaManifest || !/^[0-9a-f]{40}$/i.test(metaManifest.commit || '')) {
-    console.error('[build-bridge] ❌ Missing pinned bridge-e2ee/meta revision in vendor manifest.');
+  if (
+    !metaManifest
+    || metaManifest.upstream !== 'https://github.com/mautrix/meta.git'
+    || !/^[0-9a-f]{40}$/i.test(metaManifest.commit || '')
+  ) {
+    console.error('[build-bridge] ❌ Missing or invalid pinned bridge-e2ee/meta revision in vendor manifest.');
     process.exit(1);
   }
   console.log(`[build-bridge] 📋 fbchat-v2: version=${manifest.version} commit=${manifest.commit.slice(0, 12)}`);
 
-  // ── 2. Validate meta submodule ────────────────────────────────────────
+  // ── 2. Bootstrap and validate meta dependency ─────────────────────────
   const metaGoMod = path.join(META_DIR, 'go.mod');
   if (!fs.existsSync(metaGoMod)) {
-    console.error(`[build-bridge] ❌ meta/ not found at ${META_DIR}`);
-    console.error(`[build-bridge] Initialise the pinned submodule revision ${metaManifest.commit.slice(0, 12)} before building.`);
-    process.exit(1);
+    const bootstrapDir = `${META_DIR}.bootstrap`;
+    console.log(`[build-bridge] 📥 Initialising pinned meta revision ${metaManifest.commit.slice(0, 12)}...`);
+    fs.rmSync(bootstrapDir, { recursive: true, force: true });
+    try {
+      run(`git clone --filter=blob:none --no-checkout ${metaManifest.upstream} "${bootstrapDir}"`, { cwd: BRIDGE_DIR });
+      run(`git fetch --depth 1 origin ${metaManifest.commit}`, { cwd: bootstrapDir });
+      run('git checkout --detach FETCH_HEAD', { cwd: bootstrapDir });
+      fs.rmSync(META_DIR, { recursive: true, force: true });
+      fs.renameSync(bootstrapDir, META_DIR);
+    } catch (err) {
+      fs.rmSync(bootstrapDir, { recursive: true, force: true });
+      console.error(`[build-bridge] ❌ Could not initialise pinned meta revision: ${err.message}`);
+      process.exit(1);
+    }
   }
 
   // The checked-out meta revision must be exact. "Ahead" is not reproducible.

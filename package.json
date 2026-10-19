@@ -78,6 +78,7 @@
     "@types/uuid": "^10.0.0",
     "@vitejs/plugin-react": "^4.3.4",
     "appium": "^2.19.0",
+    "appium-uiautomator2-driver": "^4.2.9",
     "autoprefixer": "^10.4.20",
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",

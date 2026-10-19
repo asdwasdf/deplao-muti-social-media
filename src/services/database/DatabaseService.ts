@@ -1297,7 +1297,8 @@ class DatabaseService {
                 created_at              INTEGER NOT NULL,
                 updated_at              INTEGER NOT NULL,
                 comment_count_per_post  INTEGER DEFAULT NULL,
-                comment_pick_mode       TEXT DEFAULT 'sequential'
+                comment_pick_mode       TEXT DEFAULT 'sequential',
+                comment_attachments     TEXT DEFAULT '[]'
             );
             CREATE INDEX IF NOT EXISTS idx_fb_auto_comment_account ON fb_auto_comment_configs(account_id);
         `);
@@ -1325,6 +1326,12 @@ class DatabaseService {
         )?.some((c: any) => c.name === 'comment_pick_mode');
         if (!hasPickModeCol) {
             this.exec(`ALTER TABLE fb_auto_comment_configs ADD COLUMN comment_pick_mode TEXT DEFAULT 'sequential'`);
+        }
+        const hasAttachmentsCol = this.query<any>(
+            `PRAGMA table_info(fb_auto_comment_configs)`
+        )?.some((c: any) => c.name === 'comment_attachments');
+        if (!hasAttachmentsCol) {
+            this.exec(`ALTER TABLE fb_auto_comment_configs ADD COLUMN comment_attachments TEXT DEFAULT '[]'`);
         }
 
         this.exec(`

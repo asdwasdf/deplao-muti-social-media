@@ -13,6 +13,12 @@ import React, { useState, useEffect, useCallback } from 'react';
 import ipc from '../../lib/ipc';
 import { useAppStore } from '../../store/appStore';
 import { useAccountStore } from '../../store/accountStore';
+import { buildFacebookGroupPostUrl } from './postUrl';
+
+interface TemplateAttachment {
+  file_path: string;
+  preview_url?: string;
+}
 
 interface AutoCommentConfig {
   id: string;
@@ -25,6 +31,7 @@ interface AutoCommentConfig {
   doc_id_create_comment?: string | null;
   comment_count_per_post?: number;
   comment_pick_mode?: 'random' | 'sequential';
+  comment_attachments?: Array<{ file_path: string } | null>;
 }
 
 interface AutoCommentJob {
@@ -65,6 +72,17 @@ interface WorkerStatus {
   runningJobIds: string[];
   pendingCount: number;
   globalConcurrency: number;
+}
+
+type FacebookGroupFeedType = 'relevant' | 'recent_activity' | 'new_posts';
+
+interface GroupPostVerification {
+  groupId: string;
+  fetchedAt: number;
+  feedType: FacebookGroupFeedType;
+  feedUrl: string;
+  filePath: string;
+  posts: Array<{ postId: string; groupId: string; groupName: string; timestamp: number; url: string }>;
 }
 
 const DEFAULT_COMMENTS = `Shopee mình nè: https://s.shopee.vn/7pu0VWbPVd
@@ -131,6 +149,7 @@ export const AutoCommentView: React.FC = () => {
   // Form state
   const [formAccountId, setFormAccountId] = useState('');
   const [formCommentTemplates, setFormCommentTemplates] = useState<string[]>(['']);
+  const [formCommentAttachments, setFormCommentAttachments] = useState<Array<TemplateAttachment | null>>([null]);
   const [formCommentsPerPost, setFormCommentsPerPost] = useState(1);
   const [formPickMode, setFormPickMode] = useState<'sequential' | 'random'>('sequential');
   const [formGroupIds, setFormGroupIds] = useState<string[]>([]);
@@ -142,6 +161,11 @@ export const AutoCommentView: React.FC = () => {
 
   // Multi-account selection
   const [selectedAccountId, setSelectedAccountId] = useState<string>('');
+  const [demoGroupId, setDemoGroupId] = useState('');
+  const [demoPostLimit, setDemoPostLimit] = useState(10);
+  const [demoFeedType, setDemoFeedType] = useState<FacebookGroupFeedType>('new_posts');
+  const [demoLoading, setDemoLoading] = useState(false);
+  const [demoResult, setDemoResult] = useState<GroupPostVerification | null>(null);
 
   // Per-account session state cache (probed via IPC)
   const [sessionStateByAccount, setSessionStateByAccount] = useState<Record<string, { state: SessionState; reason?: string }>>({});
@@ -261,7 +285,9 @@ export const AutoCommentView: React.FC = () => {
     setSelectedConfig(null);
     setFormAccountId(selectedAccountId || fbAccounts[0]?.id || '');
     // Seed 2 mẫu mặc định từ DEFAULT_COMMENTS (split theo \n) — mỗi mẫu 1 textarea riêng.
-    setFormCommentTemplates(DEFAULT_COMMENTS.split('\n').map((s) => s.trim()).filter((s) => s));
+    const templates = DEFAULT_COMMENTS.split('\n').map((s) => s.trim()).filter((s) => s);
+    setFormCommentTemplates(templates);
+    setFormCommentAttachments(templates.map(() => null));
     setFormCommentsPerPost(2);
     setFormPickMode('sequential');
     setFormGroupIds([]);
@@ -280,6 +306,19 @@ export const AutoCommentView: React.FC = () => {
     // Mỗi mẫu = 1 phần tử (giữ nguyên \n bên trong). Nếu config rỗng, show 1 ô trống để user nhập.
     const tpls = config.comments && config.comments.length > 0 ? [...config.comments] : [''];
     setFormCommentTemplates(tpls);
+    const attachments = tpls.map((_, index) => config.comment_attachments?.[index] || null);
+    setFormCommentAttachments(attachments);
+    void Promise.all(attachments.map(async (attachment, index) => {
+      if (!attachment) return;
+      const preview = await ipc.autoComment.getTemplateImagePreview({ filePath: attachment.file_path });
+      if (preview.success && preview.preview_url) {
+        setFormCommentAttachments((current) => current.map((item, itemIndex) => (
+          itemIndex === index && item?.file_path === attachment.file_path
+            ? { ...item, preview_url: preview.preview_url }
+            : item
+        )));
+      }
+    }));
     // Legacy: thiếu comment_count_per_post → mặc định = tất cả mẫu (giữ behavior cũ).
     const perPost = typeof config.comment_count_per_post === 'number' && config.comment_count_per_post > 0
       ? config.comment_count_per_post
@@ -321,6 +360,9 @@ export const AutoCommentView: React.FC = () => {
         account_id: formAccountId,
         // Lưu nguyên văn (chưa trim ở đây — đã validate bằng trimmed[] ở trên, nhưng giữ nội dung gốc để emoji/format không bị mất whitespace quan trọng).
         comments: formCommentTemplates.map((s) => s),
+        comment_attachments: formCommentAttachments.map((attachment) => (
+          attachment ? { file_path: attachment.file_path } : null
+        )),
         group_ids: formGroupIds,
         max_posts_per_run: formMaxPosts,
         schedule_minutes: formSchedule,
@@ -353,6 +395,52 @@ export const AutoCommentView: React.FC = () => {
       if (!r.success) { setError(r.error || 'Không thể enqueue job'); return; }
       await refreshJobs([configId]);
     } catch (err: any) { setError(err.message); }
+  };
+
+  const handleOpenPostWithAccount = async (url: string) => {
+    if (!selectedAccountId) { setError('Vui lòng chọn tài khoản Facebook'); return; }
+    setError(null);
+    try {
+      const result = await ipc.autoComment.debugOpenTabWithCookie({ accountId: selectedAccountId, url });
+      if (!result.success) { setError(result.error || 'Không mở được bài viết'); return; }
+      await refreshOpenBrowsers();
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
+  const handleFetchGroupPosts = async () => {
+    if (!selectedAccountId) { setError('Vui lòng chọn tài khoản Facebook'); return; }
+    const groupId = demoGroupId.match(/groups\/(\d+)|^\s*(\d+)\s*$/)?.slice(1).find(Boolean) || '';
+    if (!groupId) { setError('Group ID không hợp lệ'); return; }
+
+    setDemoLoading(true);
+    setDemoResult(null);
+    setError(null);
+    try {
+      const result = await ipc.autoComment.fetchGroupPosts({
+        accountId: selectedAccountId,
+        groupId,
+        limit: demoPostLimit,
+        feedType: demoFeedType,
+      });
+      if (!result.success || !result.groupId || !result.fetchedAt || !result.feedType || !result.feedUrl || !result.filePath) {
+        setError(result.error || 'Không cào được bài viết');
+        return;
+      }
+      setDemoResult({
+        groupId: result.groupId,
+        fetchedAt: result.fetchedAt,
+        feedType: result.feedType,
+        feedUrl: result.feedUrl,
+        filePath: result.filePath,
+        posts: result.posts || [],
+      });
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setDemoLoading(false);
+    }
   };
 
   const handleStopFlow = async (configId: string) => {
@@ -446,21 +534,21 @@ export const AutoCommentView: React.FC = () => {
   // Đổi tổng số mẫu (N). Mỗi phần tử = 1 textarea riêng.
   const setTemplateCount = (next: number) => {
     const n = Math.max(1, Math.floor(Number(next) || 1));
-    setFormCommentTemplates((cur) => {
-      if (n === cur.length) return cur;
-      if (n > cur.length) {
-        return [...cur, ...Array(n - cur.length).fill('')];
+    if (n === formCommentTemplates.length) return;
+    if (n < formCommentTemplates.length) {
+      const removed = formCommentTemplates.slice(n);
+      if (removed.some((template) => template.trim().length > 0) || formCommentAttachments.slice(n).some(Boolean)) {
+        const ok = confirm(`Xoá ${formCommentTemplates.length - n} mẫu cuối và ảnh đính kèm của chúng?`);
+        if (!ok) return;
       }
-      // Giảm: kiểm tra mẫu sắp bị loại có nội dung không.
-      const removed = cur[n];
-      if (removed && removed.trim().length > 0) {
-        const ok = confirm(
-          `Mẫu ${n + 1} có nội dung. Xoá vĩnh viễn mẫu này?\n\n"${removed.slice(0, 80)}${removed.length > 80 ? '…' : ''}"`,
-        );
-        if (!ok) return cur;
-      }
-      return cur.slice(0, n);
-    });
+    }
+    setFormCommentTemplates((current) => (
+      n > current.length ? [...current, ...Array(n - current.length).fill('')] : current.slice(0, n)
+    ));
+    setFormCommentAttachments((current) => (
+      n > current.length ? [...current, ...Array(n - current.length).fill(null)] : current.slice(0, n)
+    ));
+    setFormCommentsPerPost((current) => Math.min(current, n));
   };
 
   const updateTemplate = (idx: number, val: string) => {
@@ -468,22 +556,44 @@ export const AutoCommentView: React.FC = () => {
   };
 
   const removeTemplate = (idx: number) => {
-    setFormCommentTemplates((cur) => {
-      if (cur.length <= 1) return cur; // luôn giữ ít nhất 1 mẫu
-      const t = cur[idx];
-      if (t && t.trim().length > 0) {
-        const ok = confirm(`Xoá mẫu ${idx + 1}?\n\n"${t.slice(0, 80)}${t.length > 80 ? '…' : ''}"`);
-        if (!ok) return cur;
-      }
-      const next = cur.filter((_, i) => i !== idx);
-      // Đồng bộ comments-per-post nếu nó vượt quá số mẫu mới.
-      if (formCommentsPerPost > next.length) setFormCommentsPerPost(next.length);
-      return next;
-    });
+    if (formCommentTemplates.length <= 1) return;
+    const template = formCommentTemplates[idx];
+    if ((template && template.trim().length > 0) || formCommentAttachments[idx]) {
+      const ok = confirm(`Xoá mẫu ${idx + 1} và ảnh đính kèm?\n\n"${template.slice(0, 80)}${template.length > 80 ? '…' : ''}"`);
+      if (!ok) return;
+    }
+    const nextTemplates = formCommentTemplates.filter((_, index) => index !== idx);
+    setFormCommentTemplates(nextTemplates);
+    setFormCommentAttachments((current) => current.filter((_, index) => index !== idx));
+    setFormCommentsPerPost((current) => Math.min(current, nextTemplates.length));
   };
 
   const addTemplate = () => {
-    setFormCommentTemplates((cur) => [...cur, '']);
+    setFormCommentTemplates((current) => [...current, '']);
+    setFormCommentAttachments((current) => [...current, null]);
+  };
+
+  const selectTemplateImage = async (idx: number) => {
+    setError(null);
+    try {
+      const result = await ipc.autoComment.selectTemplateImage();
+      if (result.canceled) return;
+      if (!result.success || !result.attachment) {
+        setError(result.error || 'Không chọn được ảnh');
+        return;
+      }
+      setFormCommentAttachments((current) => current.map((attachment, index) => (
+        index === idx ? result.attachment! : attachment
+      )));
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
+  const removeTemplateImage = (idx: number) => {
+    setFormCommentAttachments((current) => current.map((attachment, index) => (
+      index === idx ? null : attachment
+    )));
   };
 
   // ─── EDIT MODE ────────────────────────────────────────────────────────────────
@@ -638,6 +748,34 @@ export const AutoCommentView: React.FC = () => {
                       onChange={(e) => updateTemplate(idx, e.target.value)}
                       aria-label={`Nội dung mẫu ${idx + 1}`}
                     />
+                    <div className="mt-3 flex flex-wrap items-center gap-3">
+                      {formCommentAttachments[idx]?.preview_url && (
+                        <img
+                          src={formCommentAttachments[idx]!.preview_url}
+                          alt={`Ảnh mẫu ${idx + 1}`}
+                          className="w-20 h-20 object-cover rounded-lg border border-[#E2E8F0] bg-white"
+                        />
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => selectTemplateImage(idx)}
+                        className="h-9 px-3 rounded-lg border border-[#CBD5E1] bg-white text-[#334155] text-sm font-medium hover:bg-[#F1F5F9]"
+                        aria-label={`${formCommentAttachments[idx] ? 'Đổi' : 'Chọn'} ảnh cho mẫu ${idx + 1}`}
+                      >
+                        {formCommentAttachments[idx] ? 'Đổi ảnh' : 'Chọn ảnh'}
+                      </button>
+                      {formCommentAttachments[idx] && (
+                        <button
+                          type="button"
+                          onClick={() => removeTemplateImage(idx)}
+                          className="h-9 px-3 rounded-lg text-red-600 text-sm font-medium hover:bg-red-50"
+                          aria-label={`Xóa ảnh mẫu ${idx + 1}`}
+                        >
+                          Xóa ảnh
+                        </button>
+                      )}
+                      <span className="text-xs text-[#94A3B8]">JPEG, PNG, GIF hoặc WebP · tối đa 25 MiB</span>
+                    </div>
                   </div>
                 ))}
                 <button
@@ -956,6 +1094,99 @@ export const AutoCommentView: React.FC = () => {
             </button>
           </div>
         </div>
+
+        {/* Demo cào bài mới theo Group ID */}
+        {fbAccounts.length > 0 && (
+          <div className="mb-6 bg-white rounded-xl border border-[#E2E8F0] p-5">
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div>
+                <h2 className="text-base font-semibold text-[#0F172A]">Kiểm tra bài mới trong group</h2>
+                <p className="text-xs text-[#64748B] mt-1">Dùng session tài khoản đang chọn. Kết quả tự lưu thành JSON trong Downloads.</p>
+              </div>
+              {demoResult && (
+                <button
+                  onClick={() => window.electronAPI.shell.openPath(demoResult.filePath)}
+                  className="h-9 px-3 rounded-lg border border-[#E2E8F0] text-[#2563EB] text-sm font-medium hover:bg-[#EFF6FF]"
+                >
+                  Mở file JSON
+                </button>
+              )}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-[1fr_180px_120px_auto] gap-3">
+              <input
+                value={demoGroupId}
+                onChange={(event) => setDemoGroupId(event.target.value)}
+                onKeyDown={(event) => event.key === 'Enter' && handleFetchGroupPosts()}
+                placeholder="Group ID hoặc URL group"
+                className="h-11 px-4 rounded-lg border border-[#E2E8F0] text-sm focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                aria-label="Group ID cần kiểm tra"
+              />
+              <select
+                value={demoFeedType}
+                onChange={(event) => setDemoFeedType(event.target.value as FacebookGroupFeedType)}
+                className="h-11 px-3 rounded-lg border border-[#E2E8F0] bg-white text-sm focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                aria-label="Loại feed Facebook"
+              >
+                <option value="relevant">Phù hợp nhất</option>
+                <option value="recent_activity">Hoạt động gần đây</option>
+                <option value="new_posts">Bài viết mới</option>
+              </select>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={demoPostLimit}
+                onChange={(event) => setDemoPostLimit(Math.min(100, Math.max(1, parseInt(event.target.value, 10) || 1)))}
+                className="h-11 px-4 rounded-lg border border-[#E2E8F0] text-sm focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                aria-label="Số bài mới cần cào"
+              />
+              <button
+                onClick={handleFetchGroupPosts}
+                disabled={demoLoading || !selectedAccountId}
+                className="h-11 px-5 rounded-lg bg-[#2563EB] text-white text-sm font-medium hover:bg-[#1D4ED8] disabled:opacity-50"
+              >
+                {demoLoading ? 'Đang cào…' : 'Cào bài mới'}
+              </button>
+            </div>
+
+            {demoResult && (
+              <div className="mt-4">
+                <p className="text-xs text-[#64748B] mb-2">
+                  Feed: {demoResult.feedType === 'relevant' ? 'Phù hợp nhất' : demoResult.feedType === 'recent_activity' ? 'Hoạt động gần đây' : 'Bài viết mới'} · Lấy được {demoResult.posts.length} bài lúc {new Date(demoResult.fetchedAt).toLocaleString('vi-VN')} · {demoResult.filePath}
+                </p>
+                {demoResult.posts.length === 0 ? (
+                  <p className="p-3 rounded-lg bg-amber-50 text-amber-700 text-sm">Không tìm thấy bài. Kiểm tra quyền xem group và session tài khoản.</p>
+                ) : (
+                  <div className="max-h-72 overflow-auto border border-[#E2E8F0] rounded-lg">
+                    <table className="w-full text-sm">
+                      <thead className="sticky top-0 bg-[#F8FAFC] text-left text-xs text-[#64748B]">
+                        <tr><th className="p-3">#</th><th className="p-3">Post ID</th><th className="p-3">Thời gian</th><th className="p-3">Kiểm tra</th></tr>
+                      </thead>
+                      <tbody>
+                        {demoResult.posts.map((post, index) => (
+                          <tr key={post.postId} className="border-t border-[#E2E8F0]">
+                            <td className="p-3 text-[#64748B]">{index + 1}</td>
+                            <td className="p-3 font-mono text-xs text-[#0F172A]">{post.postId}</td>
+                            <td className="p-3 text-xs text-[#64748B]">{new Date(post.timestamp).toLocaleString('vi-VN')}</td>
+                            <td className="p-3">
+                              <button
+                                onClick={() => handleOpenPostWithAccount(post.url)}
+                                className="text-[#2563EB] hover:underline text-xs"
+                                title="Mở tab mới bằng cookie của tài khoản Facebook đang chọn"
+                              >
+                                Mở bằng tài khoản này
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Open browser indicator (others) */}
         {openBrowsers.size > 0 && (
@@ -1280,7 +1511,19 @@ export const AutoCommentView: React.FC = () => {
                         <tr key={l.id} className={`border-t border-[#E2E8F0] ${l.status === 'failed' ? 'bg-red-50' : ''}`}>
                           <td className="py-2 px-2 text-[#0F172A] whitespace-nowrap">{new Date(l.executed_at).toLocaleString('vi-VN')}</td>
                           <td className="py-2 px-2 text-[#0F172A]">{l.group_name || l.group_id}</td>
-                          <td className="py-2 px-2 text-[#0F172A] text-xs">{l.post_id}</td>
+                          <td className="py-2 px-2 text-xs max-w-[320px]">
+                            <a
+                              href={buildFacebookGroupPostUrl(l.group_id, l.post_id)}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                window.electronAPI.shell.openExternal(buildFacebookGroupPostUrl(l.group_id, l.post_id));
+                              }}
+                              className="text-[#2563EB] hover:underline break-all"
+                              title="Mở bằng browser hệ thống; cần đăng nhập đúng tài khoản Facebook"
+                            >
+                              {buildFacebookGroupPostUrl(l.group_id, l.post_id)}
+                            </a>
+                          </td>
                           <td className="py-2 px-2 max-w-[280px]">
                             {l.comments.map((c, i) => (
                               <p key={i} className="text-xs text-[#64748B] truncate">{i + 1}. {c}</p>
@@ -1337,7 +1580,19 @@ export const AutoCommentView: React.FC = () => {
                         <tr key={l.id} className={`border-t border-[#E2E8F0] ${l.status === 'failed' ? 'bg-red-50' : ''}`}>
                           <td className="py-2 px-2 text-[#0F172A] whitespace-nowrap">{new Date(l.executed_at).toLocaleString('vi-VN')}</td>
                           <td className="py-2 px-2 text-[#0F172A]">{l.group_name || l.group_id}</td>
-                          <td className="py-2 px-2 text-[#0F172A] text-xs">{l.post_id}</td>
+                          <td className="py-2 px-2 text-xs max-w-[320px]">
+                            <a
+                              href={buildFacebookGroupPostUrl(l.group_id, l.post_id)}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                window.electronAPI.shell.openExternal(buildFacebookGroupPostUrl(l.group_id, l.post_id));
+                              }}
+                              className="text-[#2563EB] hover:underline break-all"
+                              title="Mở bằng browser hệ thống; cần đăng nhập đúng tài khoản Facebook"
+                            >
+                              {buildFacebookGroupPostUrl(l.group_id, l.post_id)}
+                            </a>
+                          </td>
                           <td className="py-2 px-2 text-[#64748B] text-xs">{l.job_id ? l.job_id.slice(0, 8) : '(legacy)'}</td>
                           <td className="py-2 px-2">
                             <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${l.status === 'success' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
